@@ -91,6 +91,7 @@ COUNTING_ONE_DEC_BASES = {
     "g_marcel",
     "gs_marcel",
     "tbf_marcel",
+    "points",
 }
 TWO_DEC_BASES = {"era", "whip"}
 ONE_DEC_PERCENT_BASES = {"k%", "bb%", "k-bb%", "k_pct", "bb_pct", "ip", "hr/9", "hr/bbe%", "gb%", "whiff%", "swstr%", "ip_marcel"}
@@ -395,6 +396,8 @@ ROSTER_PITCHER_STARTER_SLOTS = [
 ROSTER_ALL_STARTER_SLOTS = [*ROSTER_HITTER_STARTER_SLOTS, *ROSTER_PITCHER_STARTER_SLOTS]
 ROSTER_HITTER_STATS = ["HR", "R", "RBI", "SB", "AVG", "AB", "H"]
 ROSTER_PITCHER_STATS = ["W", "K", "SV", "WHIP", "ERA", "IP", "H", "BB", "ER"]
+ROSTER_HITTER_MANUAL_COUNT_STATS = ["HR", "R", "RBI", "SB", "AB", "H"]
+ROSTER_PITCHER_MANUAL_COUNT_STATS = ["W", "K", "SV", "IP", "H", "BB", "ER"]
 ROSTER_HITTER_BENCHMARK_TOTAL = {
     "HR": 303.0,
     "R": 1043.0,
@@ -2687,6 +2690,101 @@ def _add_derived_pitcher_kpi_metrics(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _add_derived_points_metrics(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    pct_tags = ("p20", "p25", "p50", "p75", "p80", "p600")
+
+    def _num(col: str) -> pd.Series:
+        if col not in out.columns:
+            return pd.Series(np.nan, index=out.index, dtype="float64")
+        return pd.to_numeric(out[col], errors="coerce")
+
+    hitter_inputs = ["AB", "H", "Runs", "HR", "RBI", "SB"]
+    pitcher_inputs = ["IP", "H", "ER", "BB", "SO", "W", "SV", "ERA"]
+    hitter_present = sum(1 for base in hitter_inputs if f"{base}_proj_p50" in out.columns)
+    pitcher_present = sum(1 for base in pitcher_inputs if f"{base}_proj_p50" in out.columns)
+    use_pitching_formula = pitcher_present > hitter_present
+
+    for tag in pct_tags:
+        if use_pitching_formula:
+            ip = _num(f"IP_proj_{tag}")
+            h_allowed = _num(f"H_proj_{tag}")
+            er = _num(f"ER_proj_{tag}")
+            if f"ER_proj_{tag}" not in out.columns:
+                era = _num(f"ERA_proj_{tag}")
+                er = (era * ip / 9.0).where(
+                    ip.notna() & np.isfinite(ip) & (ip > 0.0),
+                    np.nan,
+                )
+            bb = _num(f"BB_proj_{tag}")
+            so = _num(f"SO_proj_{tag}")
+            w = _num(f"W_proj_{tag}")
+            sv = _num(f"SV_proj_{tag}")
+            components = {
+                "ip": ip,
+                "h": h_allowed,
+                "er": er,
+                "bb": bb,
+                "so": so,
+                "w": w,
+                "sv": sv,
+            }
+            if not any(
+                (series.notna() & np.isfinite(series)).any()
+                for series in components.values()
+            ):
+                continue
+            points = (
+                3.0 * ip.fillna(0.0)
+                - 1.0 * h_allowed.fillna(0.0)
+                - 2.0 * er.fillna(0.0)
+                - 1.0 * bb.fillna(0.0)
+                + 1.0 * so.fillna(0.0)
+                + 6.0 * w.fillna(0.0)
+                + 8.0 * sv.fillna(0.0)
+            )
+            out[f"Points_proj_{tag}"] = points
+        else:
+            ab = _num(f"AB_proj_{tag}")
+            h = _num(f"H_proj_{tag}")
+            runs = _num(f"Runs_proj_{tag}")
+            hr = _num(f"HR_proj_{tag}")
+            rbi = _num(f"RBI_proj_{tag}")
+            sb = _num(f"SB_proj_{tag}")
+            components = {
+                "ab": ab,
+                "h": h,
+                "runs": runs,
+                "hr": hr,
+                "rbi": rbi,
+                "sb": sb,
+            }
+            if not any(
+                (series.notna() & np.isfinite(series)).any()
+                for series in components.values()
+            ):
+                continue
+            points = (
+                -1.0 * ab.fillna(0.0)
+                + 4.0 * h.fillna(0.0)
+                + 2.0 * runs.fillna(0.0)
+                + 6.0 * hr.fillna(0.0)
+                + 2.0 * rbi.fillna(0.0)
+                + 5.0 * sb.fillna(0.0)
+            )
+            out[f"Points_proj_{tag}"] = points
+
+    if (
+        "Points_proj_p25" in out.columns
+        and "Points_proj_p75" in out.columns
+    ):
+        out["Points_proj_spread"] = (
+            pd.to_numeric(out["Points_proj_p75"], errors="coerce")
+            - pd.to_numeric(out["Points_proj_p25"], errors="coerce")
+        )
+    return out
+
+
 def _metric_base_from_proj_col(col: str) -> str:
     txt = str(col)
     txt_l = txt.lower()
@@ -3028,6 +3126,71 @@ def _roster_parse_int(value: object) -> int | None:
     return int(parsed)
 
 
+def _roster_parse_nonneg_float(value: object) -> float | None:
+    parsed = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
+    if pd.isna(parsed) or (not np.isfinite(float(parsed))):
+        return None
+    out = float(parsed)
+    if out < 0.0:
+        return None
+    return out
+
+
+def _roster_normalize_manual_stats(
+    value: object,
+    *,
+    hitter: bool,
+) -> dict[str, float] | None:
+    if not isinstance(value, dict):
+        return None
+    keys = (
+        ROSTER_HITTER_MANUAL_COUNT_STATS
+        if hitter
+        else ROSTER_PITCHER_MANUAL_COUNT_STATS
+    )
+    out: dict[str, float] = {}
+    any_value = False
+    for key in keys:
+        parsed = _roster_parse_nonneg_float(value.get(key))
+        if parsed is None:
+            out[key] = 0.0
+        else:
+            out[key] = float(parsed)
+            any_value = True
+    if not any_value:
+        return None
+    return out
+
+
+def _roster_hitter_stats_from_manual(
+    manual: dict[str, float] | None,
+) -> dict[str, float] | None:
+    norm = _roster_normalize_manual_stats(manual, hitter=True)
+    if norm is None:
+        return None
+    out = {k: float(norm.get(k, 0.0)) for k in ROSTER_HITTER_MANUAL_COUNT_STATS}
+    ab = float(out.get("AB", 0.0))
+    h = float(out.get("H", 0.0))
+    out["AVG"] = (h / ab) if ab > 0.0 else float("nan")
+    return out
+
+
+def _roster_pitcher_stats_from_manual(
+    manual: dict[str, float] | None,
+) -> dict[str, float] | None:
+    norm = _roster_normalize_manual_stats(manual, hitter=False)
+    if norm is None:
+        return None
+    out = {k: float(norm.get(k, 0.0)) for k in ROSTER_PITCHER_MANUAL_COUNT_STATS}
+    ip = float(out.get("IP", 0.0))
+    h = float(out.get("H", 0.0))
+    bb = float(out.get("BB", 0.0))
+    er = float(out.get("ER", 0.0))
+    out["WHIP"] = ((h + bb) / ip) if ip > 0.0 else float("nan")
+    out["ERA"] = ((9.0 * er) / ip) if ip > 0.0 else float("nan")
+    return out
+
+
 def _roster_norm_percentile(value: object, *, default: str = "p50") -> str:
     fallback = str(default or "p50").strip().lower()
     if fallback not in set(ROSTER_PERCENTILE_OPTIONS):
@@ -3046,6 +3209,8 @@ def _roster_default_state() -> dict:
         "percentile": default_pct,
         "starters": {slot: None for slot in ROSTER_ALL_STARTER_SLOTS},
         "starter_percentiles": {slot: default_pct for slot in ROSTER_ALL_STARTER_SLOTS},
+        "starter_custom_volume": {slot: None for slot in ROSTER_ALL_STARTER_SLOTS},
+        "starter_manual_stats": {slot: None for slot in ROSTER_ALL_STARTER_SLOTS},
         "hitter_reserves": [],
         "pitcher_reserves": [],
         "next_row_id": 1,
@@ -3245,7 +3410,14 @@ def _roster_selected_player_ids(state: dict) -> set[int]:
     return out
 
 
-def _roster_add_reserve_row(state: dict, *, hitter: bool, percentile: str | None = None) -> None:
+def _roster_add_reserve_row(
+    state: dict,
+    *,
+    hitter: bool,
+    percentile: str | None = None,
+    custom_volume: float | None = None,
+    manual_stats: dict[str, float] | None = None,
+) -> None:
     next_row_id = _roster_parse_int(state.get("next_row_id"))
     if next_row_id is None or next_row_id < 1:
         next_row_id = 1
@@ -3257,15 +3429,27 @@ def _roster_add_reserve_row(state: dict, *, hitter: bool, percentile: str | None
         percentile,
         default=_roster_norm_percentile(state.get("default_percentile", "p50")),
     )
-    state[key].append({"row_id": f"{prefix}_{next_row_id}", "player_id": None, "percentile": pct})
+    state[key].append(
+        {
+            "row_id": f"{prefix}_{next_row_id}",
+            "player_id": None,
+            "percentile": pct,
+            "custom_volume": _roster_parse_nonneg_float(custom_volume),
+            "manual_stats": _roster_normalize_manual_stats(manual_stats, hitter=hitter),
+        }
+    )
     state["next_row_id"] = int(next_row_id + 1)
 
 
 def _serialize_roster_state(state: dict) -> dict:
     out_starters: dict[str, int | None] = {}
     out_starter_pct: dict[str, str] = {}
+    out_starter_custom_volume: dict[str, float | None] = {}
+    out_starter_manual_stats: dict[str, dict[str, float] | None] = {}
     starters = state.get("starters", {})
     starter_percentiles = state.get("starter_percentiles", {})
+    starter_custom_volume = state.get("starter_custom_volume", {})
+    starter_manual_stats = state.get("starter_manual_stats", {})
     default_pct = _roster_norm_percentile(
         state.get("default_percentile", state.get("percentile", "p50"))
     )
@@ -3274,6 +3458,13 @@ def _serialize_roster_state(state: dict) -> dict:
         out_starters[slot] = parsed
         src_pct = starter_percentiles.get(slot) if isinstance(starter_percentiles, dict) else None
         out_starter_pct[slot] = _roster_norm_percentile(src_pct, default=default_pct)
+        src_custom = starter_custom_volume.get(slot) if isinstance(starter_custom_volume, dict) else None
+        out_starter_custom_volume[slot] = _roster_parse_nonneg_float(src_custom)
+        src_manual = starter_manual_stats.get(slot) if isinstance(starter_manual_stats, dict) else None
+        out_starter_manual_stats[slot] = _roster_normalize_manual_stats(
+            src_manual,
+            hitter=(slot in ROSTER_HITTER_STARTER_SLOTS),
+        )
 
     def _serialize_reserves(key: str) -> list[dict[str, object]]:
         rows = state.get(key, [])
@@ -3287,11 +3478,18 @@ def _serialize_roster_state(state: dict) -> dict:
             if not row_id:
                 row_id = f"{key}_{idx+1}"
             row_pct = _roster_norm_percentile(item_dict.get("percentile"), default=default_pct)
+            row_custom = _roster_parse_nonneg_float(item_dict.get("custom_volume"))
+            row_manual = _roster_normalize_manual_stats(
+                item_dict.get("manual_stats"),
+                hitter=(key == "hitter_reserves"),
+            )
             out_rows.append(
                 {
                     "row_id": row_id,
                     "player_id": parsed,
                     "percentile": row_pct,
+                    "custom_volume": row_custom,
+                    "manual_stats": row_manual,
                 }
             )
         return out_rows
@@ -3303,6 +3501,8 @@ def _serialize_roster_state(state: dict) -> dict:
         "percentile": default_pct,
         "starters": out_starters,
         "starter_percentiles": out_starter_pct,
+        "starter_custom_volume": out_starter_custom_volume,
+        "starter_manual_stats": out_starter_manual_stats,
         "hitter_reserves": _serialize_reserves("hitter_reserves"),
         "pitcher_reserves": _serialize_reserves("pitcher_reserves"),
     }
@@ -3324,12 +3524,27 @@ def _deserialize_roster_state(raw_state: object, hitter_pool: pd.DataFrame, pitc
     state["default_percentile"] = default_pct
     state["percentile"] = default_pct
     state["starter_percentiles"] = {slot: default_pct for slot in ROSTER_ALL_STARTER_SLOTS}
+    state["starter_custom_volume"] = {slot: None for slot in ROSTER_ALL_STARTER_SLOTS}
+    state["starter_manual_stats"] = {slot: None for slot in ROSTER_ALL_STARTER_SLOTS}
     starter_pct_raw = raw_state.get("starter_percentiles", {})
     if isinstance(starter_pct_raw, dict):
         for slot in ROSTER_ALL_STARTER_SLOTS:
             state["starter_percentiles"][slot] = _roster_norm_percentile(
                 starter_pct_raw.get(slot),
                 default=default_pct,
+            )
+    starter_custom_raw = raw_state.get("starter_custom_volume", {})
+    if isinstance(starter_custom_raw, dict):
+        for slot in ROSTER_ALL_STARTER_SLOTS:
+            state["starter_custom_volume"][slot] = _roster_parse_nonneg_float(
+                starter_custom_raw.get(slot)
+            )
+    starter_manual_raw = raw_state.get("starter_manual_stats", {})
+    if isinstance(starter_manual_raw, dict):
+        for slot in ROSTER_ALL_STARTER_SLOTS:
+            state["starter_manual_stats"][slot] = _roster_normalize_manual_stats(
+                starter_manual_raw.get(slot),
+                hitter=(slot in ROSTER_HITTER_STARTER_SLOTS),
             )
 
     used: set[int] = set()
@@ -3347,6 +3562,8 @@ def _deserialize_roster_state(raw_state: object, hitter_pool: pd.DataFrame, pitc
                 used.add(pid)
             else:
                 dropped += 1
+                state["starter_custom_volume"][slot] = None
+                state["starter_manual_stats"][slot] = None
         for slot in ROSTER_PITCHER_STARTER_SLOTS:
             pid = _roster_parse_int(starters.get(slot))
             if pid is None:
@@ -3357,6 +3574,8 @@ def _deserialize_roster_state(raw_state: object, hitter_pool: pd.DataFrame, pitc
                 used.add(pid)
             else:
                 dropped += 1
+                state["starter_custom_volume"][slot] = None
+                state["starter_manual_stats"][slot] = None
 
     def _load_reserves(raw_values: object, *, hitter: bool) -> None:
         nonlocal dropped
@@ -3367,8 +3586,19 @@ def _deserialize_roster_state(raw_state: object, hitter_pool: pd.DataFrame, pitc
         for item in raw_values:
             item_dict = item if isinstance(item, dict) else {"player_id": item}
             row_pct = _roster_norm_percentile(item_dict.get("percentile"), default=default_pct)
+            row_custom = _roster_parse_nonneg_float(item_dict.get("custom_volume"))
+            row_manual = _roster_normalize_manual_stats(
+                item_dict.get("manual_stats"),
+                hitter=hitter,
+            )
             pid = _roster_parse_int(item_dict.get("player_id"))
-            _roster_add_reserve_row(state, hitter=hitter, percentile=row_pct)
+            _roster_add_reserve_row(
+                state,
+                hitter=hitter,
+                percentile=row_pct,
+                custom_volume=row_custom,
+                manual_stats=row_manual,
+            )
             if pid is None:
                 continue
             if pid in valid_pool and pid not in used:
@@ -3394,6 +3624,49 @@ def _roster_numeric_from_row(row: pd.Series, col: str) -> float:
     if pd.isna(val) or (not np.isfinite(float(val))):
         return float("nan")
     return float(val)
+
+
+def _roster_apply_int_display(
+    df: pd.DataFrame,
+    cols: list[str],
+) -> pd.DataFrame:
+    out = df.copy()
+    for col in cols:
+        if col not in out.columns:
+            continue
+        out[col] = pd.to_numeric(out[col], errors="coerce").round(0).astype("Int64")
+    return out
+
+
+def _roster_style_needed_cells(
+    df: pd.DataFrame,
+    *,
+    fail_cols: set[str],
+) -> pd.DataFrame | object:
+    if df.empty or (not fail_cols) or ("Row" not in df.columns):
+        return df
+    needed_mask = df["Row"].astype(str).eq("Needed")
+    if not bool(needed_mask.any()):
+        return df
+    needed_idx = list(df.index[needed_mask])
+
+    def _style_block(frame: pd.DataFrame) -> pd.DataFrame:
+        styles = pd.DataFrame("", index=frame.index, columns=frame.columns)
+        for col in fail_cols:
+            if col not in styles.columns:
+                continue
+            for idx in needed_idx:
+                styles.at[idx, col] = (
+                    "background-color: rgba(220,53,69,0.25); "
+                    "color: #7f1d1d; font-weight: 600;"
+                )
+        return styles
+
+    styler = df.style.apply(_style_block, axis=None)
+    fmt = _float_format_map(df)
+    if fmt:
+        styler = styler.format(fmt)
+    return styler
 
 
 def _source_levels_col(df: pd.DataFrame) -> str | None:
@@ -3861,6 +4134,7 @@ def show_table(
         return
     df = _add_derived_slashline_metrics(df)
     df = _add_derived_pitcher_kpi_metrics(df)
+    df = _add_derived_points_metrics(df)
 
     key_root = f"{title}_{key_prefix}".strip("_")
     controls = st.expander(f"{title} controls", expanded=not compact_ui)
@@ -4211,6 +4485,7 @@ def show_table(
             key=f"{key_root}_pct_cols",
         )
         bp_default_order = [
+            "Points",
             "PA",
             "AB",
             "H",
@@ -4229,6 +4504,7 @@ def show_table(
             "ISO",
         ]
         pitching_default_order = [
+            "Points",
             "G",
             "GS",
             "IP",
@@ -4251,6 +4527,7 @@ def show_table(
             "GB%",
         ]
         pitcher_kpi_default_order = [
+            "Points",
             "TBF",
             "IP",
             "GS",
@@ -4274,6 +4551,7 @@ def show_table(
             "ext_reg",
         ]
         kpi_default_order = [
+            "Points",
             "PA",
             "bbe",
             "damage_rate",
@@ -4511,6 +4789,8 @@ def _show_two_stage_before_after(
 
     after = fused_df.copy()
     before = base_df.copy()
+    after = _add_derived_points_metrics(after)
+    before = _add_derived_points_metrics(before)
     if "mlbid" not in after.columns and "batter_mlbid" in after.columns:
         after["mlbid"] = pd.to_numeric(after["batter_mlbid"], errors="coerce")
     if "mlbid" not in before.columns and "batter_mlbid" in before.columns:
@@ -4626,6 +4906,7 @@ def _show_two_stage_before_after(
         return
 
     bp_default_order = [
+        "Points",
         "PA",
         "AB",
         "H",
@@ -4644,6 +4925,7 @@ def _show_two_stage_before_after(
         "ISO",
     ]
     pitching_default_order = [
+        "Points",
         "G",
         "GS",
         "IP",
@@ -5140,10 +5422,21 @@ def show_roster_manager(
     live_state["percentile"] = default_pct
     if not isinstance(live_state.get("starter_percentiles"), dict):
         live_state["starter_percentiles"] = {}
+    if not isinstance(live_state.get("starter_custom_volume"), dict):
+        live_state["starter_custom_volume"] = {}
+    if not isinstance(live_state.get("starter_manual_stats"), dict):
+        live_state["starter_manual_stats"] = {}
     for slot in ROSTER_ALL_STARTER_SLOTS:
         live_state["starter_percentiles"][slot] = _roster_norm_percentile(
             live_state["starter_percentiles"].get(slot),
             default=default_pct,
+        )
+        live_state["starter_custom_volume"][slot] = _roster_parse_nonneg_float(
+            live_state["starter_custom_volume"].get(slot)
+        )
+        live_state["starter_manual_stats"][slot] = _roster_normalize_manual_stats(
+            live_state["starter_manual_stats"].get(slot),
+            hitter=(slot in ROSTER_HITTER_STARTER_SLOTS),
         )
 
     dropped_from_state = 0
@@ -5152,6 +5445,8 @@ def show_roster_manager(
         pid = _roster_parse_int(live_state["starters"].get(slot))
         if pid is None:
             live_state["starters"][slot] = None
+            live_state["starter_custom_volume"][slot] = None
+            live_state["starter_manual_stats"][slot] = None
             continue
         if (
             pid in hitter_pool_by_id.index
@@ -5162,11 +5457,15 @@ def show_roster_manager(
             used_ids.add(pid)
         else:
             live_state["starters"][slot] = None
+            live_state["starter_custom_volume"][slot] = None
+            live_state["starter_manual_stats"][slot] = None
             dropped_from_state += 1
     for slot in ROSTER_PITCHER_STARTER_SLOTS:
         pid = _roster_parse_int(live_state["starters"].get(slot))
         if pid is None:
             live_state["starters"][slot] = None
+            live_state["starter_custom_volume"][slot] = None
+            live_state["starter_manual_stats"][slot] = None
             continue
         if (
             pid in pitcher_pool_by_id.index
@@ -5177,6 +5476,8 @@ def show_roster_manager(
             used_ids.add(pid)
         else:
             live_state["starters"][slot] = None
+            live_state["starter_custom_volume"][slot] = None
+            live_state["starter_manual_stats"][slot] = None
             dropped_from_state += 1
 
     for reserve_key, pool_by_id, hitter_flag in (
@@ -5193,15 +5494,44 @@ def show_roster_manager(
                 row_dict.get("percentile"),
                 default=default_pct,
             )
+            row_custom = _roster_parse_nonneg_float(row_dict.get("custom_volume"))
+            row_manual = _roster_normalize_manual_stats(
+                row_dict.get("manual_stats"),
+                hitter=hitter_flag,
+            )
             pid = _roster_parse_int(row_dict.get("player_id"))
             if pid is None:
-                cleaned_rows.append({"row_id": row_id, "player_id": None, "percentile": row_pct})
+                cleaned_rows.append(
+                    {
+                        "row_id": row_id,
+                        "player_id": None,
+                        "percentile": row_pct,
+                        "custom_volume": row_custom,
+                        "manual_stats": None,
+                    }
+                )
                 continue
             if pid in pool_by_id.index and pid not in used_ids:
-                cleaned_rows.append({"row_id": row_id, "player_id": pid, "percentile": row_pct})
+                cleaned_rows.append(
+                    {
+                        "row_id": row_id,
+                        "player_id": pid,
+                        "percentile": row_pct,
+                        "custom_volume": row_custom,
+                        "manual_stats": row_manual,
+                    }
+                )
                 used_ids.add(pid)
             else:
-                cleaned_rows.append({"row_id": row_id, "player_id": None, "percentile": row_pct})
+                cleaned_rows.append(
+                    {
+                        "row_id": row_id,
+                        "player_id": None,
+                        "percentile": row_pct,
+                        "custom_volume": row_custom,
+                        "manual_stats": None,
+                    }
+                )
                 dropped_from_state += 1
         live_state[reserve_key] = cleaned_rows
         if hitter_flag and (not isinstance(live_state[reserve_key], list)):
@@ -5340,16 +5670,51 @@ def show_roster_manager(
         labels = hitter_labels if hitter else pitcher_labels
         return sorted(set(out_ids), key=lambda pid: labels.get(pid, str(pid)))
 
-    def _hitter_stats_for_player(pid: int, *, pct: str) -> dict[str, float]:
+    def _hitter_stats_for_player(
+        pid: int,
+        *,
+        pct: str,
+        custom_pa: float | None = None,
+    ) -> dict[str, float]:
         row = hitter_pool_by_id.loc[int(pid)]
         out_stats: dict[str, float] = {}
         pct = _roster_norm_percentile(pct, default=state.get("default_percentile", "p50"))
         for stat, base in ROSTER_HITTER_TO_PROJ_BASE.items():
             col = f"{base}_proj_{pct}"
             out_stats[stat] = _roster_numeric_from_row(row, col)
+        pa_base = _roster_numeric_from_row(row, f"PA_proj_{pct}")
+        target_pa = _roster_parse_nonneg_float(custom_pa)
+        if (
+            target_pa is not None
+            and pd.notna(pa_base)
+            and np.isfinite(pa_base)
+            and float(pa_base) > 0.0
+        ):
+            scale = float(target_pa) / float(pa_base)
+            for stat in ["HR", "R", "RBI", "SB", "AB", "H"]:
+                raw = out_stats.get(stat, float("nan"))
+                if pd.notna(raw) and np.isfinite(float(raw)):
+                    out_stats[stat] = float(raw) * scale
+            ab = out_stats.get("AB", float("nan"))
+            h = out_stats.get("H", float("nan"))
+            if (
+                pd.notna(ab)
+                and np.isfinite(float(ab))
+                and float(ab) > 0.0
+                and pd.notna(h)
+                and np.isfinite(float(h))
+            ):
+                out_stats["AVG"] = float(h) / float(ab)
+            else:
+                out_stats["AVG"] = float("nan")
         return out_stats
 
-    def _pitcher_stats_for_player(pid: int, *, pct: str) -> dict[str, float]:
+    def _pitcher_stats_for_player(
+        pid: int,
+        *,
+        pct: str,
+        custom_ip: float | None = None,
+    ) -> dict[str, float]:
         row = pitcher_pool_by_id.loc[int(pid)]
         out_stats: dict[str, float] = {}
         pct = _roster_norm_percentile(pct, default=state.get("default_percentile", "p50"))
@@ -5362,12 +5727,115 @@ def show_roster_manager(
             out_stats["ER"] = float(era) * float(ip) / 9.0
         else:
             out_stats["ER"] = float("nan")
+        target_ip = _roster_parse_nonneg_float(custom_ip)
+        if (
+            target_ip is not None
+            and pd.notna(ip)
+            and np.isfinite(float(ip))
+            and float(ip) > 0.0
+        ):
+            scale = float(target_ip) / float(ip)
+            out_stats["IP"] = float(target_ip)
+            for stat in ["W", "K", "SV", "H", "BB", "ER"]:
+                raw = out_stats.get(stat, float("nan"))
+                if pd.notna(raw) and np.isfinite(float(raw)):
+                    out_stats[stat] = float(raw) * scale
+            h_val = out_stats.get("H", float("nan"))
+            bb_val = out_stats.get("BB", float("nan"))
+            er_val = out_stats.get("ER", float("nan"))
+            ip_val = out_stats.get("IP", float("nan"))
+            if (
+                pd.notna(ip_val)
+                and np.isfinite(float(ip_val))
+                and float(ip_val) > 0.0
+                and pd.notna(h_val)
+                and np.isfinite(float(h_val))
+                and pd.notna(bb_val)
+                and np.isfinite(float(bb_val))
+            ):
+                out_stats["WHIP"] = (float(h_val) + float(bb_val)) / float(ip_val)
+            else:
+                out_stats["WHIP"] = float("nan")
+            if (
+                pd.notna(ip_val)
+                and np.isfinite(float(ip_val))
+                and float(ip_val) > 0.0
+                and pd.notna(er_val)
+                and np.isfinite(float(er_val))
+            ):
+                out_stats["ERA"] = 9.0 * float(er_val) / float(ip_val)
+            else:
+                out_stats["ERA"] = float("nan")
         return out_stats
 
+    def _render_hitter_manual_inputs(
+        *,
+        row_key: str,
+        defaults: dict[str, float] | None,
+    ) -> dict[str, float]:
+        base_defaults = _roster_normalize_manual_stats(defaults, hitter=True) or {
+            k: 0.0 for k in ROSTER_HITTER_MANUAL_COUNT_STATS
+        }
+        cols = st.columns(6)
+        out: dict[str, float] = {}
+        for idx, stat in enumerate(ROSTER_HITTER_MANUAL_COUNT_STATS):
+            with cols[idx]:
+                out[stat] = float(
+                    st.number_input(
+                        stat,
+                        min_value=0.0,
+                        value=float(base_defaults.get(stat, 0.0)),
+                        step=1.0,
+                        key=f"{key_prefix}_{row_key}_manual_{stat}",
+                    )
+                )
+        derived = _roster_hitter_stats_from_manual(out) or {}
+        st.caption(
+            f"Manual counts (auto AVG): AVG={float(derived.get('AVG', float('nan'))):.3f}"
+        )
+        return out
+
+    def _render_pitcher_manual_inputs(
+        *,
+        row_key: str,
+        defaults: dict[str, float] | None,
+    ) -> dict[str, float]:
+        base_defaults = _roster_normalize_manual_stats(defaults, hitter=False) or {
+            k: 0.0 for k in ROSTER_PITCHER_MANUAL_COUNT_STATS
+        }
+        cols = st.columns(7)
+        out: dict[str, float] = {}
+        for idx, stat in enumerate(ROSTER_PITCHER_MANUAL_COUNT_STATS):
+            with cols[idx]:
+                out[stat] = float(
+                    st.number_input(
+                        stat,
+                        min_value=0.0,
+                        value=float(base_defaults.get(stat, 0.0)),
+                        step=(0.1 if stat == "IP" else 1.0),
+                        key=f"{key_prefix}_{row_key}_manual_{stat}",
+                    )
+                )
+        derived = _roster_pitcher_stats_from_manual(out) or {}
+        whip_val = float(derived.get("WHIP", float("nan")))
+        era_val = float(derived.get("ERA", float("nan")))
+        whip_txt = f"{whip_val:.3f}" if np.isfinite(whip_val) else "n/a"
+        era_txt = f"{era_val:.3f}" if np.isfinite(era_val) else "n/a"
+        st.caption(f"Manual counts (auto WHIP/ERA): WHIP={whip_txt}, ERA={era_txt}")
+        return out
+
     st.markdown("### Hitters (Starters)")
+    st.caption("Custom PA/IP lets you override projected volume while keeping each player's projected rates.")
     hitter_rows: list[dict[str, object]] = []
     for slot in ROSTER_HITTER_STARTER_SLOTS:
         current_id = _roster_parse_int(state["starters"].get(slot))
+        current_custom_pa = _roster_parse_nonneg_float(
+            state.get("starter_custom_volume", {}).get(slot)
+        )
+        current_manual_stats = _roster_normalize_manual_stats(
+            state.get("starter_manual_stats", {}).get(slot),
+            hitter=True,
+        )
         current_pct = _roster_norm_percentile(
             state.get("starter_percentiles", {}).get(slot),
             default=state.get("default_percentile", "p50"),
@@ -5380,7 +5848,7 @@ def show_roster_manager(
             default_idx = options.index(current_id)
         else:
             default_idx = 0
-        row_cols = st.columns([5, 1])
+        row_cols = st.columns([4, 1, 2, 1])
         with row_cols[0]:
             picked = st.selectbox(
                 f"{slot}",
@@ -5398,22 +5866,103 @@ def show_roster_manager(
                 label_visibility="collapsed",
             )
         picked_id = _roster_parse_int(picked)
+        if picked_id != current_id:
+            current_custom_pa = None
+            current_manual_stats = None
+        base_pa = float("nan")
+        if picked_id is not None and picked_id in hitter_pool_by_id.index:
+            base_pa = _roster_numeric_from_row(
+                hitter_pool_by_id.loc[int(picked_id)],
+                f"PA_proj_{_roster_norm_percentile(current_pct, default=state.get('default_percentile', 'p50'))}",
+            )
+        with row_cols[2]:
+            pa_widget_key = (
+                f"{key_prefix}_starter_h_pa_{slot}_"
+                f"{picked_id if picked_id is not None else 'none'}_{current_pct}"
+            )
+            default_pa_value = current_custom_pa
+            if default_pa_value is None:
+                default_pa_value = (
+                    float(base_pa)
+                    if (pd.notna(base_pa) and np.isfinite(float(base_pa)) and float(base_pa) >= 0.0)
+                    else 0.0
+                )
+            custom_pa_input = st.number_input(
+                f"{slot} PA",
+                min_value=0.0,
+                value=float(default_pa_value),
+                step=1.0,
+                key=pa_widget_key,
+                disabled=(picked_id is None),
+            )
+        with row_cols[3]:
+            use_manual = st.checkbox(
+                f"{slot} manual",
+                value=(current_manual_stats is not None),
+                key=f"{key_prefix}_starter_h_manual_toggle_{slot}",
+                disabled=(picked_id is None),
+                label_visibility="collapsed",
+            )
         state["starters"][slot] = picked_id
         state["starter_percentiles"][slot] = _roster_norm_percentile(
             current_pct,
             default=state.get("default_percentile", "p50"),
         )
+        if picked_id is None:
+            state["starter_custom_volume"][slot] = None
+            state["starter_manual_stats"][slot] = None
+        else:
+            parsed_custom_pa = _roster_parse_nonneg_float(custom_pa_input)
+            if (
+                parsed_custom_pa is not None
+                and pd.notna(base_pa)
+                and np.isfinite(float(base_pa))
+                and abs(float(parsed_custom_pa) - float(base_pa)) <= 1e-6
+            ):
+                parsed_custom_pa = None
+            state["starter_custom_volume"][slot] = parsed_custom_pa
+            if use_manual:
+                projected_seed = _hitter_stats_for_player(
+                    picked_id,
+                    pct=state["starter_percentiles"][slot],
+                    custom_pa=state["starter_custom_volume"].get(slot),
+                )
+                seed_manual = current_manual_stats or {
+                    stat: float(projected_seed.get(stat, 0.0))
+                    if np.isfinite(float(projected_seed.get(stat, float("nan"))))
+                    else 0.0
+                    for stat in ROSTER_HITTER_MANUAL_COUNT_STATS
+                }
+                with st.container():
+                    entered_manual = _render_hitter_manual_inputs(
+                        row_key=f"starter_h_{slot}",
+                        defaults=seed_manual,
+                    )
+                state["starter_manual_stats"][slot] = _roster_normalize_manual_stats(
+                    entered_manual,
+                    hitter=True,
+                )
+            else:
+                state["starter_manual_stats"][slot] = None
         row_out: dict[str, object] = {
             "Slot": slot,
-            "Pct": str(state["starter_percentiles"][slot]).upper(),
+            "Pct": (
+                "MANUAL"
+                if state.get("starter_manual_stats", {}).get(slot) is not None
+                else str(state["starter_percentiles"][slot]).upper()
+            ),
             "Player": _roster_display_pick_label(picked_id, hitter_labels, empty_label=""),
         }
         for stat in ROSTER_HITTER_STATS:
             row_out[stat] = float("nan")
         if picked_id is not None and picked_id in hitter_pool_by_id.index:
-            stats = _hitter_stats_for_player(
+            manual_stats = _roster_hitter_stats_from_manual(
+                state.get("starter_manual_stats", {}).get(slot)
+            )
+            stats = manual_stats or _hitter_stats_for_player(
                 picked_id,
                 pct=state["starter_percentiles"][slot],
+                custom_pa=state["starter_custom_volume"].get(slot),
             )
             for stat in ROSTER_HITTER_STATS:
                 row_out[stat] = stats.get(stat, float("nan"))
@@ -5421,8 +5970,7 @@ def show_roster_manager(
 
     hitter_df = pd.DataFrame(hitter_rows)
     if not hitter_df.empty:
-        for col in ["HR", "R", "RBI", "SB", "AB", "H"]:
-            hitter_df[col] = pd.to_numeric(hitter_df[col], errors="coerce").round(1)
+        hitter_df = _roster_apply_int_display(hitter_df, ["HR", "R", "RBI", "SB", "AB", "H"])
         hitter_df["AVG"] = pd.to_numeric(hitter_df["AVG"], errors="coerce").round(3)
     st.dataframe(hitter_df, width="stretch", hide_index=True)
 
@@ -5470,10 +6018,42 @@ def show_roster_manager(
             },
         ]
     )
-    for col in ["HR", "R", "RBI", "SB", "AB", "H"]:
-        hitter_total_rows[col] = pd.to_numeric(hitter_total_rows[col], errors="coerce").round(1)
+    hitter_total_rows = _roster_apply_int_display(hitter_total_rows, ["HR", "R", "RBI", "SB", "AB", "H"])
     hitter_total_rows["AVG"] = pd.to_numeric(hitter_total_rows["AVG"], errors="coerce").round(3)
-    st.dataframe(hitter_total_rows, width="stretch", hide_index=True)
+    hitter_fail_cols: set[str] = set()
+    if pd.notna(hitter_avg) and float(hitter_avg) < float(ROSTER_HITTER_BENCHMARK_TOTAL["AVG"]):
+        hitter_fail_cols.add("AVG")
+    hitter_total_view = _roster_style_needed_cells(
+        hitter_total_rows,
+        fail_cols=hitter_fail_cols,
+    )
+    st.dataframe(hitter_total_view, width="stretch", hide_index=True)
+    hitter_points_total = (
+        -1.0 * hitter_ab
+        + 4.0 * hitter_h
+        + 2.0 * hitter_r
+        + 6.0 * hitter_hr
+        + 2.0 * hitter_rbi
+        + 5.0 * hitter_sb
+    )
+    hitter_points_benchmark = (
+        -1.0 * float(ROSTER_HITTER_BENCHMARK_TOTAL["AB"])
+        + 4.0 * float(hitter_benchmark_h)
+        + 2.0 * float(ROSTER_HITTER_BENCHMARK_TOTAL["R"])
+        + 6.0 * float(ROSTER_HITTER_BENCHMARK_TOTAL["HR"])
+        + 2.0 * float(ROSTER_HITTER_BENCHMARK_TOTAL["RBI"])
+        + 5.0 * float(ROSTER_HITTER_BENCHMARK_TOTAL["SB"])
+    )
+    hitter_points_needed = hitter_points_benchmark - hitter_points_total
+    hitter_points_rows = pd.DataFrame(
+        [
+            {"Row": "Points Total", "Points": hitter_points_total},
+            {"Row": "Points 80th", "Points": hitter_points_benchmark},
+            {"Row": "Points Needed", "Points": hitter_points_needed},
+        ]
+    )
+    hitter_points_rows = _roster_apply_int_display(hitter_points_rows, ["Points"])
+    st.dataframe(hitter_points_rows, width="stretch", hide_index=True)
 
     hitter_slot_denom = float(len(ROSTER_HITTER_STARTER_SLOTS))
     hitter_avg_rows = pd.DataFrame(
@@ -5492,8 +6072,7 @@ def show_roster_manager(
             },
         ]
     )
-    for col in ["HR", "R", "RBI", "SB"]:
-        hitter_avg_rows[col] = pd.to_numeric(hitter_avg_rows[col], errors="coerce").round(1)
+    hitter_avg_rows = _roster_apply_int_display(hitter_avg_rows, ["HR", "R", "RBI", "SB"])
     hitter_avg_rows["AVG"] = pd.to_numeric(hitter_avg_rows["AVG"], errors="coerce").round(3)
     st.dataframe(hitter_avg_rows, width="stretch", hide_index=True)
 
@@ -5509,6 +6088,11 @@ def show_roster_manager(
     for idx, row in enumerate(state.get("hitter_reserves", [])):
         row_id = str(row.get("row_id") or f"hres_{idx+1}")
         current_id = _roster_parse_int(row.get("player_id"))
+        current_custom_pa = _roster_parse_nonneg_float(row.get("custom_volume"))
+        current_manual_stats = _roster_normalize_manual_stats(
+            row.get("manual_stats"),
+            hitter=True,
+        )
         current_pct = _roster_norm_percentile(
             row.get("percentile"),
             default=state.get("default_percentile", "p50"),
@@ -5516,7 +6100,7 @@ def show_roster_manager(
         opt_ids = _reserve_candidate_ids(hitter=True, current_id=current_id)
         options: list[int | None] = [None, *opt_ids]
         default_idx = options.index(current_id) if current_id in options else 0
-        row_cols = st.columns([5, 1, 1])
+        row_cols = st.columns([4, 1, 2, 1, 1])
         with row_cols[0]:
             picked = st.selectbox(
                 f"Hitter Reserve {idx + 1}",
@@ -5525,7 +6109,11 @@ def show_roster_manager(
                 key=f"{key_prefix}_hres_pick_{row_id}",
                 format_func=lambda v: _roster_display_pick_label(v, hitter_labels, empty_label="(empty)"),
             )
-            state["hitter_reserves"][idx]["player_id"] = _roster_parse_int(picked)
+            picked_id = _roster_parse_int(picked)
+            if picked_id != current_id:
+                current_custom_pa = None
+                current_manual_stats = None
+            state["hitter_reserves"][idx]["player_id"] = picked_id
         with row_cols[1]:
             picked_pct = st.selectbox(
                 f"Hitter Reserve {idx + 1} pct",
@@ -5538,7 +6126,84 @@ def show_roster_manager(
                 picked_pct,
                 default=state.get("default_percentile", "p50"),
             )
+        base_pa = float("nan")
+        picked_id = _roster_parse_int(state["hitter_reserves"][idx].get("player_id"))
+        if picked_id is not None and picked_id in hitter_pool_by_id.index:
+            reserve_pct = _roster_norm_percentile(
+                state["hitter_reserves"][idx].get("percentile"),
+                default=state.get("default_percentile", "p50"),
+            )
+            base_pa = _roster_numeric_from_row(
+                hitter_pool_by_id.loc[int(picked_id)],
+                f"PA_proj_{reserve_pct}",
+            )
         with row_cols[2]:
+            pa_widget_key = (
+                f"{key_prefix}_hres_pa_{row_id}_"
+                f"{picked_id if picked_id is not None else 'none'}_"
+                f"{state['hitter_reserves'][idx].get('percentile', 'p50')}"
+            )
+            default_pa_value = current_custom_pa
+            if default_pa_value is None:
+                default_pa_value = (
+                    float(base_pa)
+                    if (pd.notna(base_pa) and np.isfinite(float(base_pa)) and float(base_pa) >= 0.0)
+                    else 0.0
+                )
+            custom_pa_input = st.number_input(
+                f"Hitter Reserve {idx + 1} PA",
+                min_value=0.0,
+                value=float(default_pa_value),
+                step=1.0,
+                key=pa_widget_key,
+                disabled=(picked_id is None),
+                label_visibility="collapsed",
+            )
+            parsed_custom_pa = _roster_parse_nonneg_float(custom_pa_input)
+            if (
+                parsed_custom_pa is not None
+                and pd.notna(base_pa)
+                and np.isfinite(float(base_pa))
+                and abs(float(parsed_custom_pa) - float(base_pa)) <= 1e-6
+            ):
+                parsed_custom_pa = None
+            state["hitter_reserves"][idx]["custom_volume"] = (
+                parsed_custom_pa if picked_id is not None else None
+            )
+        with row_cols[3]:
+            use_manual = st.checkbox(
+                f"Hitter Reserve {idx + 1} manual",
+                value=(current_manual_stats is not None),
+                key=f"{key_prefix}_hres_manual_toggle_{row_id}",
+                disabled=(picked_id is None),
+                label_visibility="collapsed",
+            )
+            if picked_id is None:
+                state["hitter_reserves"][idx]["manual_stats"] = None
+            elif use_manual:
+                projected_seed = _hitter_stats_for_player(
+                    picked_id,
+                    pct=state["hitter_reserves"][idx]["percentile"],
+                    custom_pa=state["hitter_reserves"][idx]["custom_volume"],
+                )
+                seed_manual = current_manual_stats or {
+                    stat: float(projected_seed.get(stat, 0.0))
+                    if np.isfinite(float(projected_seed.get(stat, float("nan"))))
+                    else 0.0
+                    for stat in ROSTER_HITTER_MANUAL_COUNT_STATS
+                }
+                with st.container():
+                    entered_manual = _render_hitter_manual_inputs(
+                        row_key=f"hres_{row_id}",
+                        defaults=seed_manual,
+                    )
+                state["hitter_reserves"][idx]["manual_stats"] = _roster_normalize_manual_stats(
+                    entered_manual,
+                    hitter=True,
+                )
+            else:
+                state["hitter_reserves"][idx]["manual_stats"] = None
+        with row_cols[4]:
             if st.button("Remove", key=f"{key_prefix}_hres_remove_{row_id}"):
                 remove_hitter_idx = idx
     if remove_hitter_idx is not None:
@@ -5552,22 +6217,27 @@ def show_roster_manager(
             row.get("percentile"),
             default=state.get("default_percentile", "p50"),
         )
+        row_custom_pa = _roster_parse_nonneg_float(row.get("custom_volume"))
+        row_manual_stats = _roster_hitter_stats_from_manual(row.get("manual_stats"))
         row_out: dict[str, object] = {
             "Reserve Slot": f"H{idx + 1}",
-            "Pct": str(row_pct).upper(),
+            "Pct": ("MANUAL" if row_manual_stats is not None else str(row_pct).upper()),
             "Player": _roster_display_pick_label(pid, hitter_labels, empty_label=""),
         }
         for stat in ROSTER_HITTER_STATS:
             row_out[stat] = float("nan")
         if pid is not None and pid in hitter_pool_by_id.index:
-            stats = _hitter_stats_for_player(pid, pct=row_pct)
+            stats = row_manual_stats or _hitter_stats_for_player(
+                pid,
+                pct=row_pct,
+                custom_pa=row_custom_pa,
+            )
             for stat in ROSTER_HITTER_STATS:
                 row_out[stat] = stats.get(stat, float("nan"))
         hitter_reserve_rows.append(row_out)
     hitter_reserve_df = pd.DataFrame(hitter_reserve_rows)
     if not hitter_reserve_df.empty:
-        for col in ["HR", "R", "RBI", "SB", "AB", "H"]:
-            hitter_reserve_df[col] = pd.to_numeric(hitter_reserve_df[col], errors="coerce").round(1)
+        hitter_reserve_df = _roster_apply_int_display(hitter_reserve_df, ["HR", "R", "RBI", "SB", "AB", "H"])
         hitter_reserve_df["AVG"] = pd.to_numeric(hitter_reserve_df["AVG"], errors="coerce").round(3)
         st.dataframe(hitter_reserve_df, width="stretch", hide_index=True)
     else:
@@ -5577,6 +6247,13 @@ def show_roster_manager(
     pitcher_rows: list[dict[str, object]] = []
     for slot in ROSTER_PITCHER_STARTER_SLOTS:
         current_id = _roster_parse_int(state["starters"].get(slot))
+        current_custom_ip = _roster_parse_nonneg_float(
+            state.get("starter_custom_volume", {}).get(slot)
+        )
+        current_manual_stats = _roster_normalize_manual_stats(
+            state.get("starter_manual_stats", {}).get(slot),
+            hitter=False,
+        )
         current_pct = _roster_norm_percentile(
             state.get("starter_percentiles", {}).get(slot),
             default=state.get("default_percentile", "p50"),
@@ -5586,7 +6263,7 @@ def show_roster_manager(
         if current_id is not None and current_id not in options:
             options.append(current_id)
         default_idx = options.index(current_id) if current_id in options else 0
-        row_cols = st.columns([5, 1])
+        row_cols = st.columns([4, 1, 2, 1])
         with row_cols[0]:
             picked = st.selectbox(
                 f"{slot}",
@@ -5604,30 +6281,111 @@ def show_roster_manager(
                 label_visibility="collapsed",
             )
         picked_id = _roster_parse_int(picked)
+        if picked_id != current_id:
+            current_custom_ip = None
+            current_manual_stats = None
+        base_ip = float("nan")
+        if picked_id is not None and picked_id in pitcher_pool_by_id.index:
+            base_ip = _roster_numeric_from_row(
+                pitcher_pool_by_id.loc[int(picked_id)],
+                f"IP_proj_{_roster_norm_percentile(current_pct, default=state.get('default_percentile', 'p50'))}",
+            )
+        with row_cols[2]:
+            ip_widget_key = (
+                f"{key_prefix}_starter_p_ip_{slot}_"
+                f"{picked_id if picked_id is not None else 'none'}_{current_pct}"
+            )
+            default_ip_value = current_custom_ip
+            if default_ip_value is None:
+                default_ip_value = (
+                    float(base_ip)
+                    if (pd.notna(base_ip) and np.isfinite(float(base_ip)) and float(base_ip) >= 0.0)
+                    else 0.0
+                )
+            custom_ip_input = st.number_input(
+                f"{slot} IP",
+                min_value=0.0,
+                value=float(default_ip_value),
+                step=0.1,
+                key=ip_widget_key,
+                disabled=(picked_id is None),
+            )
+        with row_cols[3]:
+            use_manual = st.checkbox(
+                f"{slot} manual",
+                value=(current_manual_stats is not None),
+                key=f"{key_prefix}_starter_p_manual_toggle_{slot}",
+                disabled=(picked_id is None),
+                label_visibility="collapsed",
+            )
         state["starters"][slot] = picked_id
         state["starter_percentiles"][slot] = _roster_norm_percentile(
             current_pct,
             default=state.get("default_percentile", "p50"),
         )
+        if picked_id is None:
+            state["starter_custom_volume"][slot] = None
+            state["starter_manual_stats"][slot] = None
+        else:
+            parsed_custom_ip = _roster_parse_nonneg_float(custom_ip_input)
+            if (
+                parsed_custom_ip is not None
+                and pd.notna(base_ip)
+                and np.isfinite(float(base_ip))
+                and abs(float(parsed_custom_ip) - float(base_ip)) <= 1e-6
+            ):
+                parsed_custom_ip = None
+            state["starter_custom_volume"][slot] = parsed_custom_ip
+            if use_manual:
+                projected_seed = _pitcher_stats_for_player(
+                    picked_id,
+                    pct=state["starter_percentiles"][slot],
+                    custom_ip=state["starter_custom_volume"].get(slot),
+                )
+                seed_manual = current_manual_stats or {
+                    stat: float(projected_seed.get(stat, 0.0))
+                    if np.isfinite(float(projected_seed.get(stat, float("nan"))))
+                    else 0.0
+                    for stat in ROSTER_PITCHER_MANUAL_COUNT_STATS
+                }
+                with st.container():
+                    entered_manual = _render_pitcher_manual_inputs(
+                        row_key=f"starter_p_{slot}",
+                        defaults=seed_manual,
+                    )
+                state["starter_manual_stats"][slot] = _roster_normalize_manual_stats(
+                    entered_manual,
+                    hitter=False,
+                )
+            else:
+                state["starter_manual_stats"][slot] = None
         row_out: dict[str, object] = {
             "Slot": slot,
-            "Pct": str(state["starter_percentiles"][slot]).upper(),
+            "Pct": (
+                "MANUAL"
+                if state.get("starter_manual_stats", {}).get(slot) is not None
+                else str(state["starter_percentiles"][slot]).upper()
+            ),
             "Player": _roster_display_pick_label(picked_id, pitcher_labels, empty_label=""),
         }
         for stat in ROSTER_PITCHER_STATS:
             row_out[stat] = float("nan")
         if picked_id is not None and picked_id in pitcher_pool_by_id.index:
-            stats = _pitcher_stats_for_player(
+            manual_stats = _roster_pitcher_stats_from_manual(
+                state.get("starter_manual_stats", {}).get(slot)
+            )
+            stats = manual_stats or _pitcher_stats_for_player(
                 picked_id,
                 pct=state["starter_percentiles"][slot],
+                custom_ip=state["starter_custom_volume"].get(slot),
             )
             for stat in ROSTER_PITCHER_STATS:
                 row_out[stat] = stats.get(stat, float("nan"))
         pitcher_rows.append(row_out)
     pitcher_df = pd.DataFrame(pitcher_rows)
     if not pitcher_df.empty:
-        for col in ["W", "K", "SV", "IP", "H", "BB", "ER"]:
-            pitcher_df[col] = pd.to_numeric(pitcher_df[col], errors="coerce").round(1)
+        pitcher_df = _roster_apply_int_display(pitcher_df, ["W", "K", "SV", "H", "BB", "ER"])
+        pitcher_df["IP"] = pd.to_numeric(pitcher_df["IP"], errors="coerce").round(1)
         for col in ["WHIP", "ERA"]:
             pitcher_df[col] = pd.to_numeric(pitcher_df[col], errors="coerce").round(3)
     st.dataframe(pitcher_df, width="stretch", hide_index=True)
@@ -5673,11 +6431,48 @@ def show_roster_manager(
             },
         ]
     )
-    for col in ["W", "K", "SV", "IP", "H", "BB", "ER"]:
-        pitcher_total_rows[col] = pd.to_numeric(pitcher_total_rows[col], errors="coerce").round(1)
+    pitcher_total_rows = _roster_apply_int_display(pitcher_total_rows, ["W", "K", "SV", "H", "BB", "ER"])
+    pitcher_total_rows["IP"] = pd.to_numeric(pitcher_total_rows["IP"], errors="coerce").round(1)
     for col in ["WHIP", "ERA"]:
         pitcher_total_rows[col] = pd.to_numeric(pitcher_total_rows[col], errors="coerce").round(3)
-    st.dataframe(pitcher_total_rows, width="stretch", hide_index=True)
+    pitcher_fail_cols: set[str] = set()
+    if pd.notna(pit_era) and float(pit_era) > float(ROSTER_PITCHER_BENCHMARK_TOTAL["ERA"]):
+        pitcher_fail_cols.add("ERA")
+    if pd.notna(pit_whip) and float(pit_whip) > float(ROSTER_PITCHER_BENCHMARK_TOTAL["WHIP"]):
+        pitcher_fail_cols.add("WHIP")
+    pitcher_total_view = _roster_style_needed_cells(
+        pitcher_total_rows,
+        fail_cols=pitcher_fail_cols,
+    )
+    st.dataframe(pitcher_total_view, width="stretch", hide_index=True)
+    pitcher_points_total = (
+        3.0 * pit_ip
+        - 1.0 * pit_h
+        - 2.0 * pit_er
+        - 1.0 * pit_bb
+        + 1.0 * pit_k
+        + 6.0 * pit_w
+        + 8.0 * pit_sv
+    )
+    pitcher_points_benchmark = (
+        3.0 * float(ROSTER_PITCHER_BENCHMARK_TOTAL["IP"])
+        - 1.0 * float(ROSTER_PITCHER_BENCHMARK_TOTAL["H"])
+        - 2.0 * float(ROSTER_PITCHER_BENCHMARK_TOTAL["ER"])
+        - 1.0 * float(ROSTER_PITCHER_BENCHMARK_TOTAL["BB"])
+        + 1.0 * float(ROSTER_PITCHER_BENCHMARK_TOTAL["K"])
+        + 6.0 * float(ROSTER_PITCHER_BENCHMARK_TOTAL["W"])
+        + 8.0 * float(ROSTER_PITCHER_BENCHMARK_TOTAL["SV"])
+    )
+    pitcher_points_needed = pitcher_points_benchmark - pitcher_points_total
+    pitcher_points_rows = pd.DataFrame(
+        [
+            {"Row": "Points Total", "Points": pitcher_points_total},
+            {"Row": "Points 80th", "Points": pitcher_points_benchmark},
+            {"Row": "Points Needed", "Points": pitcher_points_needed},
+        ]
+    )
+    pitcher_points_rows = _roster_apply_int_display(pitcher_points_rows, ["Points"])
+    st.dataframe(pitcher_points_rows, width="stretch", hide_index=True)
 
     pitcher_slot_denom = float(len(ROSTER_PITCHER_STARTER_SLOTS))
     pitcher_avg_rows = pd.DataFrame(
@@ -5696,8 +6491,7 @@ def show_roster_manager(
             },
         ]
     )
-    for col in ["W", "K", "SV"]:
-        pitcher_avg_rows[col] = pd.to_numeric(pitcher_avg_rows[col], errors="coerce").round(1)
+    pitcher_avg_rows = _roster_apply_int_display(pitcher_avg_rows, ["W", "K", "SV"])
     for col in ["WHIP", "ERA"]:
         pitcher_avg_rows[col] = pd.to_numeric(pitcher_avg_rows[col], errors="coerce").round(3)
     st.dataframe(pitcher_avg_rows, width="stretch", hide_index=True)
@@ -5714,6 +6508,11 @@ def show_roster_manager(
     for idx, row in enumerate(state.get("pitcher_reserves", [])):
         row_id = str(row.get("row_id") or f"pres_{idx+1}")
         current_id = _roster_parse_int(row.get("player_id"))
+        current_custom_ip = _roster_parse_nonneg_float(row.get("custom_volume"))
+        current_manual_stats = _roster_normalize_manual_stats(
+            row.get("manual_stats"),
+            hitter=False,
+        )
         current_pct = _roster_norm_percentile(
             row.get("percentile"),
             default=state.get("default_percentile", "p50"),
@@ -5721,7 +6520,7 @@ def show_roster_manager(
         opt_ids = _reserve_candidate_ids(hitter=False, current_id=current_id)
         options: list[int | None] = [None, *opt_ids]
         default_idx = options.index(current_id) if current_id in options else 0
-        row_cols = st.columns([5, 1, 1])
+        row_cols = st.columns([4, 1, 2, 1, 1])
         with row_cols[0]:
             picked = st.selectbox(
                 f"Pitcher Reserve {idx + 1}",
@@ -5730,7 +6529,11 @@ def show_roster_manager(
                 key=f"{key_prefix}_pres_pick_{row_id}",
                 format_func=lambda v: _roster_display_pick_label(v, pitcher_labels, empty_label="(empty)"),
             )
-            state["pitcher_reserves"][idx]["player_id"] = _roster_parse_int(picked)
+            picked_id = _roster_parse_int(picked)
+            if picked_id != current_id:
+                current_custom_ip = None
+                current_manual_stats = None
+            state["pitcher_reserves"][idx]["player_id"] = picked_id
         with row_cols[1]:
             picked_pct = st.selectbox(
                 f"Pitcher Reserve {idx + 1} pct",
@@ -5743,7 +6546,84 @@ def show_roster_manager(
                 picked_pct,
                 default=state.get("default_percentile", "p50"),
             )
+        base_ip = float("nan")
+        picked_id = _roster_parse_int(state["pitcher_reserves"][idx].get("player_id"))
+        if picked_id is not None and picked_id in pitcher_pool_by_id.index:
+            reserve_pct = _roster_norm_percentile(
+                state["pitcher_reserves"][idx].get("percentile"),
+                default=state.get("default_percentile", "p50"),
+            )
+            base_ip = _roster_numeric_from_row(
+                pitcher_pool_by_id.loc[int(picked_id)],
+                f"IP_proj_{reserve_pct}",
+            )
         with row_cols[2]:
+            ip_widget_key = (
+                f"{key_prefix}_pres_ip_{row_id}_"
+                f"{picked_id if picked_id is not None else 'none'}_"
+                f"{state['pitcher_reserves'][idx].get('percentile', 'p50')}"
+            )
+            default_ip_value = current_custom_ip
+            if default_ip_value is None:
+                default_ip_value = (
+                    float(base_ip)
+                    if (pd.notna(base_ip) and np.isfinite(float(base_ip)) and float(base_ip) >= 0.0)
+                    else 0.0
+                )
+            custom_ip_input = st.number_input(
+                f"Pitcher Reserve {idx + 1} IP",
+                min_value=0.0,
+                value=float(default_ip_value),
+                step=0.1,
+                key=ip_widget_key,
+                disabled=(picked_id is None),
+                label_visibility="collapsed",
+            )
+            parsed_custom_ip = _roster_parse_nonneg_float(custom_ip_input)
+            if (
+                parsed_custom_ip is not None
+                and pd.notna(base_ip)
+                and np.isfinite(float(base_ip))
+                and abs(float(parsed_custom_ip) - float(base_ip)) <= 1e-6
+            ):
+                parsed_custom_ip = None
+            state["pitcher_reserves"][idx]["custom_volume"] = (
+                parsed_custom_ip if picked_id is not None else None
+            )
+        with row_cols[3]:
+            use_manual = st.checkbox(
+                f"Pitcher Reserve {idx + 1} manual",
+                value=(current_manual_stats is not None),
+                key=f"{key_prefix}_pres_manual_toggle_{row_id}",
+                disabled=(picked_id is None),
+                label_visibility="collapsed",
+            )
+            if picked_id is None:
+                state["pitcher_reserves"][idx]["manual_stats"] = None
+            elif use_manual:
+                projected_seed = _pitcher_stats_for_player(
+                    picked_id,
+                    pct=state["pitcher_reserves"][idx]["percentile"],
+                    custom_ip=state["pitcher_reserves"][idx]["custom_volume"],
+                )
+                seed_manual = current_manual_stats or {
+                    stat: float(projected_seed.get(stat, 0.0))
+                    if np.isfinite(float(projected_seed.get(stat, float("nan"))))
+                    else 0.0
+                    for stat in ROSTER_PITCHER_MANUAL_COUNT_STATS
+                }
+                with st.container():
+                    entered_manual = _render_pitcher_manual_inputs(
+                        row_key=f"pres_{row_id}",
+                        defaults=seed_manual,
+                    )
+                state["pitcher_reserves"][idx]["manual_stats"] = _roster_normalize_manual_stats(
+                    entered_manual,
+                    hitter=False,
+                )
+            else:
+                state["pitcher_reserves"][idx]["manual_stats"] = None
+        with row_cols[4]:
             if st.button("Remove", key=f"{key_prefix}_pres_remove_{row_id}"):
                 remove_pitcher_idx = idx
     if remove_pitcher_idx is not None:
@@ -5757,22 +6637,28 @@ def show_roster_manager(
             row.get("percentile"),
             default=state.get("default_percentile", "p50"),
         )
+        row_custom_ip = _roster_parse_nonneg_float(row.get("custom_volume"))
+        row_manual_stats = _roster_pitcher_stats_from_manual(row.get("manual_stats"))
         row_out: dict[str, object] = {
             "Reserve Slot": f"P{idx + 1}",
-            "Pct": str(row_pct).upper(),
+            "Pct": ("MANUAL" if row_manual_stats is not None else str(row_pct).upper()),
             "Player": _roster_display_pick_label(pid, pitcher_labels, empty_label=""),
         }
         for stat in ROSTER_PITCHER_STATS:
             row_out[stat] = float("nan")
         if pid is not None and pid in pitcher_pool_by_id.index:
-            stats = _pitcher_stats_for_player(pid, pct=row_pct)
+            stats = row_manual_stats or _pitcher_stats_for_player(
+                pid,
+                pct=row_pct,
+                custom_ip=row_custom_ip,
+            )
             for stat in ROSTER_PITCHER_STATS:
                 row_out[stat] = stats.get(stat, float("nan"))
         pitcher_reserve_rows.append(row_out)
     pitcher_reserve_df = pd.DataFrame(pitcher_reserve_rows)
     if not pitcher_reserve_df.empty:
-        for col in ["W", "K", "SV", "IP", "H", "BB", "ER"]:
-            pitcher_reserve_df[col] = pd.to_numeric(pitcher_reserve_df[col], errors="coerce").round(1)
+        pitcher_reserve_df = _roster_apply_int_display(pitcher_reserve_df, ["W", "K", "SV", "H", "BB", "ER"])
+        pitcher_reserve_df["IP"] = pd.to_numeric(pitcher_reserve_df["IP"], errors="coerce").round(1)
         for col in ["WHIP", "ERA"]:
             pitcher_reserve_df[col] = pd.to_numeric(pitcher_reserve_df[col], errors="coerce").round(3)
         st.dataframe(pitcher_reserve_df, width="stretch", hide_index=True)
@@ -6126,6 +7012,26 @@ def _run_roster_manager_interface() -> None:
 
     roster_hitters = _attach_40man_context(roster_hitters, for_pitchers=False)
     roster_pitchers = _attach_40man_context(roster_pitchers, for_pitchers=True)
+
+    # Keep roster values aligned with Projection Sandbox default transforms.
+    roster_hitters, _ = _apply_role_playing_time_adjustments(
+        roster_hitters,
+        for_pitchers=False,
+    )
+    roster_pitchers, _ = _apply_role_playing_time_adjustments(
+        roster_pitchers,
+        for_pitchers=True,
+    )
+    roster_pitchers, _ = _redistribute_team_saves_by_role(roster_pitchers)
+    roster_pitchers, _ = _apply_projected_il_volume_cut(
+        roster_pitchers,
+        cut_share=0.33,
+    )
+    roster_pitchers, _ = _apply_team_mlb_ip_source_allocation(roster_pitchers)
+    st.caption(
+        "Applied default Projection Sandbox adjustments: role blend, saves redistribution, "
+        "projected IL volume cut (33%), and MLB IP source allocation."
+    )
 
     show_roster_manager(
         roster_hitters,
