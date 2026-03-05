@@ -3619,6 +3619,19 @@ def _roster_display_pick_label(player_id: object, labels_by_id: dict[int, str], 
     return str(labels_by_id.get(pid, f"Unknown - FA - {pid}"))
 
 
+def _roster_reset_ui_widget_state(key_prefix: str) -> None:
+    # Streamlit widget keys persist across navigation/reruns; clear roster row widgets
+    # when loading/clearing rosters so pickers re-hydrate from saved state.
+    reset_prefixes = (
+        f"{key_prefix}_starter_",
+        f"{key_prefix}_hres_",
+        f"{key_prefix}_pres_",
+    )
+    for key in list(st.session_state.keys()):
+        if any(str(key).startswith(prefix) for prefix in reset_prefixes):
+            st.session_state.pop(key, None)
+
+
 def _roster_numeric_from_row(row: pd.Series, col: str) -> float:
     val = pd.to_numeric(pd.Series([row.get(col)]), errors="coerce").iloc[0]
     if pd.isna(val) or (not np.isfinite(float(val))):
@@ -5612,6 +5625,7 @@ def show_roster_manager(
                         pitcher_pool,
                     )
                     st.session_state[state_key] = loaded_state
+                    _roster_reset_ui_widget_state(key_prefix)
                     if dropped > 0:
                         st.warning(f"Loaded with {int(dropped)} dropped invalid/duplicate player selections.")
                     st.rerun()
@@ -5633,6 +5647,7 @@ def show_roster_manager(
     with action_cols[3]:
         if st.button("Clear roster", key=f"{key_prefix}_clear_btn"):
             st.session_state[state_key] = _roster_default_state()
+            _roster_reset_ui_widget_state(key_prefix)
             st.rerun()
 
     def _starter_candidate_ids(slot: str, *, hitter: bool, current_id: int | None) -> list[int]:
