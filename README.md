@@ -48,3 +48,16 @@ This script syncs upstream outputs into the sandbox filenames used by `projectio
 ## GitHub note
 
 - Review `.streamlit/secrets.toml` before pushing. It may contain secrets and should usually be excluded.
+
+## Added damage interface (open access)
+
+- `damage_streamlit.py` is now copied into this repo and patched to run without login/subscription gating.
+- Required damage datasets were copied as `.parquet` files (same names expected by the app's CSV loader).
+
+Launch both interfaces from one entrypoint:
+
+```powershell
+streamlit run projection_streamlit.py
+```
+
+Then use the sidebar `Application` selector to switch between `Projection Sandbox` and `Damage Interface`.

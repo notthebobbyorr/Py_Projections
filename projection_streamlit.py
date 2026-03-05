@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import posixpath
+import runpy
 import re
 import unicodedata
 import xml.etree.ElementTree as ET
@@ -4549,10 +4551,9 @@ def show_component_slash_predictions(
         )
 
 
-def main() -> None:
-    st.set_page_config(page_title="Projection Sandbox", layout="wide")
-    st.title("Projection Sandbox (Standalone)")
-    st.caption("This app is intentionally separate from damage_streamlit.py.")
+def _run_projection_sandbox() -> None:
+    st.title("Projection Sandbox")
+    st.caption("Unified app: use the sidebar to switch between Projection Sandbox and Damage Interface.")
     compact_ui = st.toggle(
         "Compact UI",
         value=False,
@@ -4804,6 +4805,38 @@ def main() -> None:
         comp_tab_idx = 4
     with tabs[comp_tab_idx]:
         show_component_slash_predictions(component_slash_hist, component_slash_kpi)
+
+
+
+def _run_damage_interface() -> None:
+    damage_app_path = Path(__file__).with_name("damage_streamlit.py")
+    if not damage_app_path.exists():
+        st.error(f"Missing damage app script: {damage_app_path}")
+        return
+
+    prev_embed = os.environ.get("PY_PROJECTIONS_EMBED_DAMAGE")
+    os.environ["PY_PROJECTIONS_EMBED_DAMAGE"] = "1"
+    try:
+        runpy.run_path(str(damage_app_path), run_name="__pyprojections_damage__")
+    finally:
+        if prev_embed is None:
+            os.environ.pop("PY_PROJECTIONS_EMBED_DAMAGE", None)
+        else:
+            os.environ["PY_PROJECTIONS_EMBED_DAMAGE"] = prev_embed
+
+
+def main() -> None:
+    st.set_page_config(page_title="Projection + Damage", layout="wide")
+    app_mode = st.sidebar.radio(
+        "Application",
+        options=["Projection Sandbox", "Damage Interface"],
+        index=0,
+        key="py_projections_app_mode",
+    )
+    if app_mode == "Damage Interface":
+        _run_damage_interface()
+        return
+    _run_projection_sandbox()
 
 
 if __name__ == "__main__":
