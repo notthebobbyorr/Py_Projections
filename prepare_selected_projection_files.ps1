@@ -1,3 +1,7 @@
+param(
+  [switch]$IncludeRecency311
+)
+
 $ErrorActionPreference = "Stop"
 
 $map = @(
@@ -10,6 +14,19 @@ $map = @(
     Dest   = "projection_outputs/sandbox/two_stage_kpi_pitcher_projections_2026.parquet"
   }
 )
+
+if($IncludeRecency311){
+  $map += @(
+    @{
+      Source = "projection_outputs/lb2_refresh_recency_3_1_1/pitcher_projections.parquet"
+      Dest   = "projection_outputs/sandbox/pitcher_kpi_projections_2026_recency_3_1_1.parquet"
+    },
+    @{
+      Source = "BP_pitching_rate_projections_2026_non_ar_post_inv_coh_recency_3_1_1.parquet"
+      Dest   = "projection_outputs/sandbox/two_stage_kpi_pitcher_projections_2026_recency_3_1_1.parquet"
+    }
+  )
+}
 
 foreach($item in $map){
   if(-not (Test-Path $item.Source)){

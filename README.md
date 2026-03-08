@@ -19,8 +19,10 @@ streamlit run projection_streamlit.py
 
 - `projection_outputs/sandbox/kpi_projections_2026.parquet`
 - `projection_outputs/sandbox/pitcher_kpi_projections_2026.parquet`
+- `projection_outputs/sandbox/pitcher_kpi_projections_2026_recency_3_1_1.parquet` (optional 3/1/1 variant)
 - `projection_outputs/sandbox/traditional_two_stage_projections_2026.parquet`
 - `projection_outputs/sandbox/two_stage_kpi_pitcher_projections_2026.parquet`
+- `projection_outputs/sandbox/two_stage_kpi_pitcher_projections_2026_recency_3_1_1.parquet` (optional 3/1/1 variant)
 - `projection_outputs/sandbox/traditional_projections_2026.parquet` (used by Before vs After tab)
 
 ## Included process scripts
@@ -44,6 +46,12 @@ powershell -ExecutionPolicy Bypass -File .\prepare_selected_projection_files.ps1
 ```
 
 This script syncs upstream outputs into the sandbox filenames used by `projection_streamlit.py`.
+
+For 3/1/1 pitcher variants, run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\build_pitcher_recency_3_1_1_variants.ps1
+```
 
 ## GitHub note
 

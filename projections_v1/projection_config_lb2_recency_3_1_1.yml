@@ -1,0 +1,111 @@
+global:
+  recency_weights: [3, 1, 1]
+  default_k: 200.0
+  uncertainty_draws: 2000
+  seed: 7
+  cov_blend_global: 0.6
+  local_k: 200
+  local_min_k: 40
+  uncertainty_c: 120.0
+  uncertainty_d: 20.0
+  mlb_level_id: 1
+  projection_version: v1_lb2_recency_3_1_1
+  output_dir: projection_outputs/lb2_refresh_recency_3_1_1
+  backtest_uncertainty_draws: 300
+  min_age_samples: 20
+  bp_hitting_rates_path: projection_outputs/bp_hitting_api/bp_hitting_table_with_level_id.parquet
+
+datasets:
+  hitters:
+    regressed_path: hitters_regressed.parquet
+    base_path: damage_pos_2015_2025.parquet
+    id_col: batter_mlbid
+    name_col: hitter_name
+    season_col: season
+    level_col: level_id
+    age_col: baseball_age
+    exposure_col: PA
+    fallback_exposure_col: bbe
+    hand_col: null
+    team_col: team
+    extra_numeric_cols: []
+  pitchers:
+    regressed_path: pitchers_regressed.parquet
+    base_path: pitcher_stuff_new.parquet
+    id_col: pitcher_mlbid
+    name_col: name
+    season_col: season
+    level_col: level_id
+    age_col: baseball_age
+    exposure_col: TBF
+    fallback_exposure_col: IP
+    hand_col: pitcher_hand
+    team_col: null
+    extra_numeric_cols: [GS, stuff_raw]
+
+metrics:
+  hitters:
+    include: []
+    include_extra: [PA, bbe]
+    bounds:
+      pull_FB_pct_reg: [0, 100]
+      chase_reg: [0, 100]
+      z_con_reg: [0, 100]
+      secondary_whiff_pct_reg: [0, 100]
+      whiffs_vs_95_reg: [0, 100]
+      damage_rate_reg: [0, 100]
+      selection_skill_reg: [0, 100]
+      hittable_pitches_taken_reg: [0, 100]
+      LA_lte_0_reg: [0, 100]
+      LD_pct_reg: [0, 100]
+      LA_gte_20_reg: [0, 100]
+      contact_vs_avg_reg: [-100, 100]
+      PA: [0, 750]
+      bbe: [0, 650]
+    k_overrides:
+      EV90th_reg: 100.0
+      max_EV_reg: 120.0
+      PA: 300.0
+      bbe: 260.0
+  pitchers:
+    include:
+      - SwStr_reg
+      - Ball_pct_reg
+      - Z_Contact_reg
+      - Chase_reg
+      - CSW_reg
+      - pWhiff_reg
+      - FA_pct_reg
+      - LA_lte_0_reg
+      - LD_pct_reg
+      - LA_gte_20_reg
+      - BB_rpm_reg
+      - FA_spin_eff_reg
+      - fastball_velo_reg
+      - max_velo_reg
+      - fastball_vaa_reg
+      - rel_z_reg
+      - rel_x_reg
+      - ext_reg
+      - arm_angle_reg
+    include_extra: [TBF, IP, GS, stuff_raw]
+    bounds:
+      SwStr_reg: [0, 100]
+      Ball_pct_reg: [0, 100]
+      Z_Contact_reg: [0, 100]
+      Chase_reg: [0, 100]
+      CSW_reg: [0, 100]
+      FA_pct_reg: [0, 100]
+      LA_lte_0_reg: [0, 100]
+      LD_pct_reg: [0, 100]
+      LA_gte_20_reg: [0, 100]
+      FA_spin_eff_reg: [0, 100]
+      TBF: [0, 950]
+      IP: [0, 260]
+      GS: [0, 40]
+    k_overrides:
+      max_velo_reg: 120.0
+      stuff_raw: 80.0
+      TBF: 300.0
+      IP: 260.0
+      GS: 120.0

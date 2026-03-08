@@ -2516,6 +2516,7 @@ def build_bp_pitching_rate_projections_2026(
     out_age_curve_path: Path,
     uncertainty_draws: int = 2000,
     seed: int = 7,
+    recency_weights: tuple[float, float, float] = MARCEL_RECENCY_WEIGHTS,
     metric_recency_weights: dict[str, list[float]] | None = None,
     default_k: float = 200.0,
     k_scale: float = 1.0,
@@ -2527,6 +2528,13 @@ def build_bp_pitching_rate_projections_2026(
     kpi_min_tbf: float = 100.0,
     kpi_max_z: float = 2.5,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
+    rw_raw = list(recency_weights)[:3]
+    if len(rw_raw) < 3:
+        rw_raw = list(MARCEL_RECENCY_WEIGHTS)
+    rw = tuple(float(x) for x in rw_raw[:3])
+    if any((not np.isfinite(float(x))) or (float(x) <= 0.0) for x in rw):
+        rw = MARCEL_RECENCY_WEIGHTS
+
     raw = pd.read_parquet(input_path)
     raw = _derive_pitching_component_metrics(raw)
     raw_actual_er = raw.copy()
@@ -2644,7 +2652,7 @@ def build_bp_pitching_rate_projections_2026(
     )
 
     gcfg = GlobalConfig(
-        recency_weights=list(MARCEL_RECENCY_WEIGHTS),
+        recency_weights=list(rw),
         recency_weights_by_metric=dict(metric_recency_weights or {}),
         default_k=float(default_k),
         uncertainty_draws=int(uncertainty_draws),
@@ -2785,9 +2793,13 @@ def build_bp_pitching_rate_projections_2026(
         proj,
         hist_actual=hist_actual,
         source_season=source_season,
+        recent_weights=rw,
     )
     proj = _apply_marcel_games_started_games(
-        proj, hist_raw=hist_raw, source_season=source_season
+        proj,
+        hist_raw=hist_raw,
+        source_season=source_season,
+        weights=rw,
     )
     proj = _finalize_rate_percentiles(
         proj, metric_cols=RATE_METRICS, bounds=RATE_BOUNDS
@@ -2930,6 +2942,14 @@ def _parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--metric-recency-weights-json", type=Path, default=None)
+    parser.add_argument(
+        "--recency-weights",
+        type=float,
+        nargs=3,
+        default=list(MARCEL_RECENCY_WEIGHTS),
+        metavar=("W0", "W1", "W2"),
+        help="Global Marcel recency weights [most_recent, year_minus_1, year_minus_2].",
+    )
     parser.add_argument("--uncertainty-draws", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--default-k", type=float, default=200.0)
@@ -2999,6 +3019,7 @@ def main() -> None:
         out_age_curve_path=args.out_age_curves,
         uncertainty_draws=int(args.uncertainty_draws),
         seed=int(args.seed),
+        recency_weights=tuple(float(x) for x in list(args.recency_weights)[:3]),
         metric_recency_weights=metric_recency_weights,
         default_k=float(args.default_k),
         k_scale=float(args.k_scale),

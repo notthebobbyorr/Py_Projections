@@ -93,7 +93,29 @@ COUNTING_ONE_DEC_BASES = {
     "tbf_marcel",
     "points",
 }
-TWO_DEC_BASES = {"era", "whip"}
+TWO_DEC_BASES = {"era", "whip", "points/pa", "points/ip", "sgp", "sgp_hit", "sgp_pitch"}
+SGP_DENOMINATORS = {
+    "R": 16.856119,
+    "HR": 7.491698,
+    "RBI": 18.370355,
+    "SB": 6.551795,
+    "AVG": 0.001353,
+    "W": 2.589256,
+    "SV": 4.629408,
+    "SO": 30.233919,
+    "ERA": 0.070897,
+    "WHIP": 0.011483,
+}
+SGP_BASELINES = {
+    "AB0": 7085.24,
+    "H0": 1786.51,
+    "AVG0": 0.2521448705170637,
+    "IP0": 1251.01,
+    "ER0": 535.28,
+    "BBH0": 1522.27,
+    "ERA0": 3.8508695225771272,
+    "WHIP0": 1.216830493419272,
+}
 ONE_DEC_PERCENT_BASES = {"k%", "bb%", "k-bb%", "k_pct", "bb_pct", "ip", "hr/9", "hr/bbe%", "gb%", "whiff%", "swstr%", "ip_marcel"}
 FLIPPED_PERCENTILE_BASES = {"K%", "CS"}
 PITCHING_FLIPPED_PERCENTILE_BASES = {"ERA", "BB%", "BABIP", "WHIP"}
@@ -182,6 +204,9 @@ KPI_COMPARE_BASES = {
 }
 P50_DISPLAY_ALIASES = {
     "PA": "PA",
+    "SGP": "SGP",
+    "SGP_hit": "SGP Hit",
+    "SGP_pitch": "SGP Pitch",
     "AB": "AB",
     "H": "H",
     "HR": "HR",
@@ -224,6 +249,8 @@ DISPLAY_COL_ALIASES = {
     "age_used": "age",
     "opening_day_status_40man": "Opening Day Status",
     "is_mlb_ip_source": "MLB IP Source",
+    "is_mlb_pa_source": "MLB PA Source",
+    "is_mlb_sb_source": "MLB SB Source",
 }
 DISPLAY_ROUNDING_BASE_OVERRIDES = {
     "pitch grade": "stuff_raw",
@@ -276,8 +303,14 @@ TEAM_IP_MAX = 1470.0
 TEAM_IP_TARGET_MU = 1435.0
 TEAM_IP_TARGET_SD = 17.5
 TEAM_GS_TARGET = 162.0
+TEAM_PA_MIN = 5900.0
+TEAM_PA_MAX = 6300.0
+TEAM_PA_TARGET_MU = 6100.0
+TEAM_PA_TARGET_SD = 100.0
 TEAM_SV_MEAN = 40.7
 TEAM_SV_STD = 6.7
+MLB_SB_TARGET_2025 = 3440.0
+MLB_SBA_TARGET_2025 = 4429.0
 SV_QUANTILE_Z = {
     "p20": -0.8416212335729143,
     "p25": -0.6744897501960817,
@@ -363,7 +396,12 @@ POSITION_TOKEN_NORMALIZATION = {
     "RP": "P",
     "DH": "UT",
 }
-ROSTER_MANAGER_SAVE_PATH = Path("projection_outputs/sandbox/roster_manager_saved_teams.json")
+ROSTER_MANAGER_SAVE_PATH = (
+    Path(__file__).resolve().parent
+    / "projection_outputs"
+    / "sandbox"
+    / "roster_manager_saved_teams.json"
+)
 ROSTER_MANAGER_SCHEMA_VERSION = 1
 ROSTER_PERCENTILE_OPTIONS = ("p25", "p50", "p75")
 ROSTER_HITTER_STARTER_SLOTS = [
@@ -1027,6 +1065,76 @@ def _is_projected_il_role(role: object) -> bool:
     return ("PROJECTED INJURED LIST" in txt) or ("PROJECTED IL" in txt)
 
 
+def _hitter_opening_day_role_priority(role: object) -> int:
+    txt = str(role or "").strip().upper()
+    if not txt:
+        return 99
+    if "LINEUP REGULAR" in txt:
+        return 1
+    if "PLATOON VS L" in txt:
+        return 2
+    if "PLATOON VS R" in txt:
+        return 3
+    if txt == "BENCH":
+        return 4
+    if "LINEUP/BENCH CANDIDATE" in txt:
+        return 5
+    if ("PROJECTED INJURED LIST (MILB)" in txt) or ("PROJECTED IL (MILB)" in txt):
+        return 10
+    if ("PROJECTED INJURED LIST" in txt) or ("PROJECTED IL" in txt):
+        return 6
+    if "BENCH CANDIDATE" in txt:
+        return 7
+    if "LINEUP CANDIDATE" in txt:
+        return 8
+    if "OPTIONED" in txt:
+        return 9
+    if "DFA" in txt:
+        return 11
+    if "REASSIGNED" in txt:
+        return 12
+    if ("60-DAY IL" in txt) or ("60 DAY IL" in txt):
+        return 13
+    return 99
+
+
+def _allocate_with_caps(
+    desired: pd.Series,
+    cap: pd.Series,
+    *,
+    total_target: float,
+    max_iter: int = 12,
+) -> pd.Series:
+    idx = desired.index
+    out = pd.Series(0.0, index=idx, dtype="float64")
+    cap_vals = pd.to_numeric(cap, errors="coerce").fillna(0.0).clip(lower=0.0)
+    desired_vals = pd.to_numeric(desired, errors="coerce").fillna(0.0).clip(lower=0.0)
+    out = np.minimum(desired_vals, cap_vals)
+    remaining = float(max(total_target, 0.0) - float(out.sum()))
+    if remaining <= 1e-9:
+        return out
+    for _ in range(int(max_iter)):
+        room = (cap_vals - out).clip(lower=0.0)
+        active = room > 1e-9
+        if not bool(active.any()):
+            break
+        weights = desired_vals.where(active, 0.0)
+        if float(weights.sum()) <= 1e-12:
+            weights = room.where(active, 0.0)
+        if float(weights.sum()) <= 1e-12:
+            break
+        add = remaining * (weights / float(weights.sum()))
+        add = np.minimum(add, room)
+        gained = float(add.sum())
+        if gained <= 1e-9:
+            break
+        out = out + add
+        remaining -= gained
+        if remaining <= 1e-9:
+            break
+    return out
+
+
 def _mlb_source_level_mask(df: pd.DataFrame) -> pd.Series:
     out = pd.Series(False, index=df.index, dtype="bool")
     used_any = False
@@ -1328,6 +1436,424 @@ def _apply_team_mlb_ip_source_allocation(
         "team_ip_sd": float(team_ip_post.std(ddof=0)) if len(team_ip_post) >= 2 else np.nan,
         "team_g_mean": float(team_g_post.mean()) if not team_g_post.empty else np.nan,
         "team_gs_mean": float(team_gs_post.mean()) if not team_gs_post.empty else np.nan,
+    }
+
+
+def _apply_team_mlb_pa_source_allocation(
+    df: pd.DataFrame,
+) -> tuple[pd.DataFrame, dict[str, float]]:
+    out = df.copy()
+    if out.empty:
+        out["is_mlb_pa_source"] = False
+        out["mlb_pa_source_share"] = 0.0
+        return out, {
+            "teams_adjusted": 0,
+            "rows_selected": 0,
+            "team_pa_mean": np.nan,
+            "team_pa_sd": np.nan,
+            "team_pa_min": np.nan,
+            "team_pa_max": np.nan,
+        }
+
+    team_col = _team_col(out)
+    if team_col is None or "PA_proj_p50" not in out.columns:
+        out["is_mlb_pa_source"] = False
+        out["mlb_pa_source_share"] = 0.0
+        return out, {
+            "teams_adjusted": 0,
+            "rows_selected": 0,
+            "team_pa_mean": np.nan,
+            "team_pa_sd": np.nan,
+            "team_pa_min": np.nan,
+            "team_pa_max": np.nan,
+        }
+
+    fallback_team_key = out[team_col].map(
+        lambda v: _team_tokens(v)[0] if _team_tokens(v) else ""
+    )
+    team_40 = (
+        out["team_40man"].fillna("").astype(str).str.strip().str.upper()
+        if "team_40man" in out.columns
+        else pd.Series("", index=out.index, dtype="string")
+    )
+    team_key = team_40.where(team_40.ne(""), fallback_team_key)
+
+    mlb_teams = set()
+    lookup = _load_40man_lookup(for_pitchers=False)
+    if not lookup.empty and "team_40man" in lookup.columns:
+        mlb_teams = {
+            str(v).strip().upper()
+            for v in lookup["team_40man"].dropna().astype(str).tolist()
+            if str(v).strip()
+        }
+    if not mlb_teams:
+        mlb_teams = {t for t in team_key.dropna().astype(str).tolist() if t}
+
+    mlb_mask = _mlb_source_level_mask(out)
+    pa50 = pd.to_numeric(out["PA_proj_p50"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    role_txt = (
+        out.get("opening_day_status_40man", pd.Series("", index=out.index))
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    role_priority = out.get(
+        "opening_day_status_40man",
+        pd.Series("", index=out.index),
+    ).map(_hitter_opening_day_role_priority)
+
+    candidate_mask = (
+        team_key.ne("")
+        & team_key.isin(mlb_teams)
+        & mlb_mask
+        & role_txt.ne("")
+        & (pa50 > 0.0)
+    )
+    if not bool(candidate_mask.any()):
+        out["is_mlb_pa_source"] = False
+        out["mlb_pa_source_share"] = 0.0
+        return out, {
+            "teams_adjusted": 0,
+            "rows_selected": 0,
+            "team_pa_mean": np.nan,
+            "team_pa_sd": np.nan,
+            "team_pa_min": np.nan,
+            "team_pa_max": np.nan,
+        }
+
+    raw_team_pa = (
+        pd.DataFrame({"team": team_key, "pa": pa50, "cand": candidate_mask})
+        .loc[lambda x: x["cand"]]
+        .groupby("team")["pa"]
+        .sum()
+    )
+    if raw_team_pa.empty:
+        out["is_mlb_pa_source"] = False
+        out["mlb_pa_source_share"] = 0.0
+        return out, {
+            "teams_adjusted": 0,
+            "rows_selected": 0,
+            "team_pa_mean": np.nan,
+            "team_pa_sd": np.nan,
+            "team_pa_min": np.nan,
+            "team_pa_max": np.nan,
+        }
+
+    raw_mu = float(raw_team_pa.mean())
+    raw_sd = float(raw_team_pa.std(ddof=0))
+    if not np.isfinite(raw_sd) or raw_sd <= 1e-8:
+        raw_sd = np.nan
+
+    frac = pd.Series(0.0, index=out.index, dtype="float64")
+    team_target_pa: dict[str, float] = {}
+    teams_adjusted = 0
+    for team, team_total_pa in raw_team_pa.items():
+        team_idx = out.index[team_key.eq(team) & candidate_mask]
+        if len(team_idx) == 0:
+            continue
+        block = pd.DataFrame(
+            {
+                "idx": team_idx,
+                "priority": pd.to_numeric(role_priority.loc[team_idx], errors="coerce").fillna(99.0),
+                "pa": pa50.loc[team_idx],
+            }
+        ).sort_values(
+            ["priority", "pa"],
+            ascending=[True, False],
+        )
+        if block.empty:
+            continue
+
+        if np.isfinite(raw_sd):
+            z = (float(team_total_pa) - raw_mu) / raw_sd
+            target_pa = float(TEAM_PA_TARGET_MU + (z * TEAM_PA_TARGET_SD))
+        else:
+            target_pa = float(TEAM_PA_TARGET_MU)
+        target_pa = float(np.clip(target_pa, TEAM_PA_MIN, TEAM_PA_MAX))
+        team_target_pa[str(team)] = target_pa
+        rem_pa = target_pa
+
+        for row in block.itertuples(index=False):
+            idx = int(row.idx)
+            pa_i = float(max(row.pa, 0.0))
+            if pa_i <= 0.0:
+                continue
+            take = float(np.clip(rem_pa / pa_i, 0.0, 1.0))
+            if take <= 1e-9:
+                continue
+            frac.loc[idx] = max(frac.loc[idx], take)
+            rem_pa -= take * pa_i
+            if rem_pa <= 1e-6:
+                break
+        teams_adjusted += 1
+
+    src_mask = frac > 1e-9
+    out["is_mlb_pa_source"] = src_mask
+    out["mlb_pa_source_share"] = frac
+
+    vol_bases = [
+        "PA",
+        "AB",
+        "H",
+        "1B",
+        "2B",
+        "3B",
+        "HR",
+        "Runs",
+        "RBI",
+        "SB",
+        "CS",
+        "SBA",
+        "BB",
+        "SO",
+        "HBP",
+        "SF",
+        "SH",
+        "bbe",
+        "BIP",
+    ]
+    pct_tags = ["p20", "p25", "p50", "p75", "p80", "p600"]
+    contrib_cols: dict[str, pd.Series] = {}
+    for base in vol_bases:
+        for tag in pct_tags:
+            col = f"{base}_proj_{tag}"
+            if col not in out.columns:
+                continue
+            cur = pd.to_numeric(out[col], errors="coerce").fillna(0.0)
+            contrib_cols[col] = cur * frac
+
+    for team in sorted(team_target_pa.keys()):
+        team_mask = team_key.eq(team) & src_mask
+        if not bool(team_mask.any()):
+            continue
+        cur_pa = float(
+            contrib_cols.get(
+                "PA_proj_p50",
+                pd.Series(0.0, index=out.index, dtype="float64"),
+            ).loc[team_mask].sum()
+        )
+        tgt_pa = float(team_target_pa[team])
+        pa_factor = (tgt_pa / cur_pa) if cur_pa > 1e-9 else 1.0
+        if np.isfinite(pa_factor) and pa_factor > 0.0:
+            for base in vol_bases:
+                for tag in pct_tags:
+                    col = f"{base}_proj_{tag}"
+                    if col not in contrib_cols:
+                        continue
+                    contrib_cols[col].loc[team_mask] = (
+                        contrib_cols[col].loc[team_mask] * pa_factor
+                    )
+
+    for tag in pct_tags:
+        sba_col = f"SBA_proj_{tag}"
+        sb_col = f"SB_proj_{tag}"
+        cs_col = f"CS_proj_{tag}"
+        if sba_col in contrib_cols and sb_col in contrib_cols:
+            contrib_cols[sb_col] = np.minimum(
+                contrib_cols[sb_col],
+                contrib_cols[sba_col],
+            )
+            if cs_col in contrib_cols:
+                contrib_cols[cs_col] = (
+                    contrib_cols[sba_col] - contrib_cols[sb_col]
+                ).clip(lower=0.0)
+
+    for col, vals in contrib_cols.items():
+        out[f"{col}_mlb_source"] = vals
+
+    team_pa_post = (
+        pd.DataFrame(
+            {
+                "team": team_key,
+                "pa": contrib_cols.get(
+                    "PA_proj_p50",
+                    pd.Series(0.0, index=out.index, dtype="float64"),
+                ),
+                "src": src_mask,
+            }
+        )
+        .loc[lambda x: x["src"] & x["team"].ne("")]
+        .groupby("team")["pa"]
+        .sum()
+    )
+    return out, {
+        "teams_adjusted": int(teams_adjusted),
+        "rows_selected": int(src_mask.sum()),
+        "team_pa_mean": float(team_pa_post.mean()) if not team_pa_post.empty else np.nan,
+        "team_pa_sd": float(team_pa_post.std(ddof=0)) if len(team_pa_post) >= 2 else np.nan,
+        "team_pa_min": float(team_pa_post.min()) if not team_pa_post.empty else np.nan,
+        "team_pa_max": float(team_pa_post.max()) if not team_pa_post.empty else np.nan,
+    }
+
+
+def _apply_hitter_mlb_sb_sba_source_allocation(
+    df: pd.DataFrame,
+    *,
+    target_sb_total: float = MLB_SB_TARGET_2025,
+    target_sba_total: float = MLB_SBA_TARGET_2025,
+) -> tuple[pd.DataFrame, dict[str, float]]:
+    out = df.copy()
+    out["is_mlb_sb_source"] = False
+    if out.empty:
+        out["mlb_sb_source_share"] = 0.0
+        return out, {"rows_selected": 0, "sb_total_p50": np.nan, "sba_total_p50": np.nan}
+
+    team_col = _team_col(out)
+    if team_col is None:
+        out["mlb_sb_source_share"] = 0.0
+        return out, {"rows_selected": 0, "sb_total_p50": np.nan, "sba_total_p50": np.nan}
+    if "SB_proj_p50" not in out.columns or "SBA_proj_p50" not in out.columns:
+        out["mlb_sb_source_share"] = 0.0
+        return out, {"rows_selected": 0, "sb_total_p50": np.nan, "sba_total_p50": np.nan}
+
+    fallback_team_key = out[team_col].map(
+        lambda v: _team_tokens(v)[0] if _team_tokens(v) else ""
+    )
+    team_40 = (
+        out["team_40man"].fillna("").astype(str).str.strip().str.upper()
+        if "team_40man" in out.columns
+        else pd.Series("", index=out.index, dtype="string")
+    )
+    team_key = team_40.where(team_40.ne(""), fallback_team_key)
+
+    mlb_teams = set()
+    lookup = _load_40man_lookup(for_pitchers=False)
+    if not lookup.empty and "team_40man" in lookup.columns:
+        mlb_teams = {
+            str(v).strip().upper()
+            for v in lookup["team_40man"].dropna().astype(str).tolist()
+            if str(v).strip()
+        }
+    if not mlb_teams:
+        mlb_teams = {t for t in team_key.dropna().astype(str).tolist() if t}
+
+    mlb_mask = _mlb_source_level_mask(out)
+    role_txt = (
+        out.get("opening_day_status_40man", pd.Series("", index=out.index))
+        .fillna("")
+        .astype(str)
+        .str.strip()
+    )
+    role_priority = role_txt.map(_hitter_opening_day_role_priority)
+    sba50 = pd.to_numeric(out["SBA_proj_p50"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    sb50 = pd.to_numeric(out["SB_proj_p50"], errors="coerce").fillna(0.0).clip(lower=0.0)
+    sb50 = np.minimum(sb50, sba50)
+
+    candidate_mask = (
+        team_key.ne("")
+        & team_key.isin(mlb_teams)
+        & mlb_mask
+        & role_txt.ne("")
+        & (sba50 > 0.0)
+    )
+    if not bool(candidate_mask.any()):
+        out["mlb_sb_source_share"] = 0.0
+        return out, {"rows_selected": 0, "sb_total_p50": np.nan, "sba_total_p50": np.nan}
+
+    max_rank = 13.0
+    priority_w = (max_rank + 1.0 - pd.to_numeric(role_priority, errors="coerce").fillna(99.0)).clip(lower=0.0)
+
+    sb_target = float(max(target_sb_total, 0.0))
+    sba_target = float(max(target_sba_total, sb_target))
+
+    w_sba = (sba50 * priority_w).where(candidate_mask, 0.0)
+    if float(w_sba.sum()) <= 1e-9:
+        w_sba = sba50.where(candidate_mask, 0.0)
+    if float(w_sba.sum()) <= 1e-9:
+        out["mlb_sb_source_share"] = 0.0
+        return out, {"rows_selected": 0, "sb_total_p50": np.nan, "sba_total_p50": np.nan}
+
+    sba_alloc50 = pd.Series(0.0, index=out.index, dtype="float64")
+    sba_alloc50.loc[candidate_mask] = (
+        sba_target
+        * (w_sba.loc[candidate_mask] / float(w_sba.loc[candidate_mask].sum()))
+    )
+
+    w_sb = (sb50 * priority_w).where(candidate_mask, 0.0)
+    if float(w_sb.sum()) <= 1e-9:
+        w_sb = sb50.where(candidate_mask, 0.0)
+    if float(w_sb.sum()) <= 1e-9:
+        w_sb = sba_alloc50.where(candidate_mask, 0.0)
+    sb_desired50 = pd.Series(0.0, index=out.index, dtype="float64")
+    if float(w_sb.sum()) > 1e-9:
+        sb_desired50.loc[candidate_mask] = (
+            sb_target
+            * (w_sb.loc[candidate_mask] / float(w_sb.loc[candidate_mask].sum()))
+        )
+    sb_alloc50 = pd.Series(0.0, index=out.index, dtype="float64")
+    sb_alloc50.loc[candidate_mask] = _allocate_with_caps(
+        sb_desired50.loc[candidate_mask],
+        sba_alloc50.loc[candidate_mask],
+        total_target=sb_target,
+    )
+    no_sb_baseline = float(sb50.where(candidate_mask, 0.0).sum()) <= 1e-9
+
+    sba_share = pd.Series(0.0, index=out.index, dtype="float64")
+    sb_share = pd.Series(0.0, index=out.index, dtype="float64")
+    sba_denom_ok = sba50 > 1e-12
+    sb_denom_ok = sb50 > 1e-12
+    sba_share.loc[sba_denom_ok] = (
+        sba_alloc50.loc[sba_denom_ok] / sba50.loc[sba_denom_ok]
+    )
+    sb_share.loc[sb_denom_ok] = (
+        sb_alloc50.loc[sb_denom_ok] / sb50.loc[sb_denom_ok]
+    )
+    sba_share = sba_share.where(candidate_mask, 0.0).fillna(0.0).clip(lower=0.0)
+    sb_share = sb_share.where(candidate_mask, 0.0).fillna(0.0).clip(lower=0.0)
+    src_mask = candidate_mask & (sba_share > 1e-9)
+    out["is_mlb_sb_source"] = src_mask
+    out["mlb_sb_source_share"] = sba_share
+
+    pct_tags = ["p20", "p25", "p50", "p75", "p80", "p600"]
+    contrib_cols: dict[str, pd.Series] = {}
+    for tag in pct_tags:
+        sba_col = f"SBA_proj_{tag}"
+        sb_col = f"SB_proj_{tag}"
+        cs_col = f"CS_proj_{tag}"
+        if sba_col in out.columns:
+            sba_cur = pd.to_numeric(out[sba_col], errors="coerce").fillna(0.0).clip(lower=0.0)
+            sba_new = (sba_cur * sba_share).where(src_mask, 0.0)
+            contrib_cols[sba_col] = sba_new
+        if sb_col in out.columns:
+            if no_sb_baseline and sba_col in contrib_cols:
+                sb_new = (
+                    contrib_cols[sba_col]
+                    * (sb_target / float(max(sba_target, 1e-9)))
+                ).where(src_mask, 0.0)
+            else:
+                sb_cur = pd.to_numeric(out[sb_col], errors="coerce").fillna(0.0).clip(lower=0.0)
+                sb_new = (sb_cur * sb_share).where(src_mask, 0.0)
+            if sba_col in contrib_cols:
+                sb_new = np.minimum(sb_new, contrib_cols[sba_col])
+            contrib_cols[sb_col] = sb_new
+        if cs_col in out.columns:
+            if sba_col in contrib_cols and sb_col in contrib_cols:
+                cs_new = (contrib_cols[sba_col] - contrib_cols[sb_col]).clip(lower=0.0)
+            else:
+                cs_cur = pd.to_numeric(out[cs_col], errors="coerce").fillna(0.0).clip(lower=0.0)
+                cs_new = (cs_cur * sba_share).where(src_mask, 0.0)
+            contrib_cols[cs_col] = cs_new
+
+        pa_col = f"PA_proj_{tag}"
+        sba_rate_col = f"stolen_base_attempt_rate_pa_mlb_eq_non_ar_delta_proj_{tag}"
+        sb_succ_col = f"stolen_base_success_rate_mlb_eq_non_ar_delta_proj_{tag}"
+        if pa_col in out.columns and sba_rate_col in out.columns and sba_col in contrib_cols:
+            pa_vals = pd.to_numeric(out[pa_col], errors="coerce").fillna(0.0).clip(lower=0.0)
+            out[sba_rate_col] = _safe_divide(contrib_cols[sba_col], pa_vals).clip(lower=0.0, upper=1.0)
+        if sb_succ_col in out.columns and sb_col in contrib_cols and sba_col in contrib_cols:
+            out[sb_succ_col] = _safe_divide(contrib_cols[sb_col], contrib_cols[sba_col]).clip(lower=0.0, upper=1.0)
+
+    for col, vals in contrib_cols.items():
+        out[col] = vals
+        out[f"{col}_mlb_source"] = vals
+
+    out = _recompute_projection_spreads(out)
+    sb_total = float(pd.to_numeric(out.get("SB_proj_p50"), errors="coerce").fillna(0.0).sum())
+    sba_total = float(pd.to_numeric(out.get("SBA_proj_p50"), errors="coerce").fillna(0.0).sum())
+    return out, {
+        "rows_selected": int(src_mask.sum()),
+        "sb_total_p50": sb_total,
+        "sba_total_p50": sba_total,
     }
 
 
@@ -2693,11 +3219,19 @@ def _add_derived_pitcher_kpi_metrics(df: pd.DataFrame) -> pd.DataFrame:
 def _add_derived_points_metrics(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     pct_tags = ("p20", "p25", "p50", "p75", "p80", "p600")
+    sgp_den = SGP_DENOMINATORS
+    sgp_base = SGP_BASELINES
 
     def _num(col: str) -> pd.Series:
         if col not in out.columns:
             return pd.Series(np.nan, index=out.index, dtype="float64")
         return pd.to_numeric(out[col], errors="coerce")
+
+    def _num_any(cols: list[str]) -> pd.Series:
+        for col in cols:
+            if col in out.columns:
+                return pd.to_numeric(out[col], errors="coerce")
+        return pd.Series(np.nan, index=out.index, dtype="float64")
 
     hitter_inputs = ["AB", "H", "Runs", "HR", "RBI", "SB"]
     pitcher_inputs = ["IP", "H", "ER", "BB", "SO", "W", "SV", "ERA"]
@@ -2774,6 +3308,72 @@ def _add_derived_points_metrics(df: pd.DataFrame) -> pd.DataFrame:
             )
             out[f"Points_proj_{tag}"] = points
 
+        pts_col = f"Points_proj_{tag}"
+        if pts_col in out.columns:
+            points_vals = pd.to_numeric(out[pts_col], errors="coerce")
+            pa_col = f"PA_proj_{tag}"
+            if pa_col in out.columns:
+                pa_vals = pd.to_numeric(out[pa_col], errors="coerce")
+                pa_den = pa_vals.where(pa_vals.abs() > 1e-12, np.nan)
+                out[f"Points/PA_proj_{tag}"] = points_vals / pa_den
+            ip_col = f"IP_proj_{tag}"
+            ip_fallback_col = f"IP_marcel_proj_{tag}"
+            if ip_col in out.columns or ip_fallback_col in out.columns:
+                ip_vals = (
+                    pd.to_numeric(out[ip_col], errors="coerce")
+                    if ip_col in out.columns
+                    else pd.to_numeric(out[ip_fallback_col], errors="coerce")
+                )
+                ip_den = ip_vals.where(ip_vals.abs() > 1e-12, np.nan)
+                out[f"Points/IP_proj_{tag}"] = points_vals / ip_den
+
+        # Roto SGP (15-team 5x5) calibrated from 2025 Draft Champions standings.
+        runs = _num_any([f"Runs_proj_{tag}", f"R_proj_{tag}"])
+        hr = _num_any([f"HR_proj_{tag}"])
+        rbi = _num_any([f"RBI_proj_{tag}"])
+        sb = _num_any([f"SB_proj_{tag}"])
+        ab = _num_any([f"AB_proj_{tag}"])
+        h = _num_any([f"H_proj_{tag}"])
+        w = _num_any([f"W_proj_{tag}"])
+        sv = _num_any([f"SV_proj_{tag}"])
+        so = _num_any([f"SO_proj_{tag}", f"K_proj_{tag}"])
+        ip = _num_any([f"IP_proj_{tag}", f"IP_marcel_proj_{tag}"])
+        bb = _num_any([f"BB_proj_{tag}"])
+        h_allowed = _num_any([f"H_proj_{tag}"])
+        er = _num_any([f"ER_proj_{tag}"])
+        if f"ER_proj_{tag}" not in out.columns:
+            era = _num_any([f"ERA_proj_{tag}"])
+            er = (era * ip / 9.0).where(ip.notna() & np.isfinite(ip) & (ip > 0.0), np.nan)
+        if f"H_proj_{tag}" not in out.columns:
+            whip = _num_any([f"WHIP_proj_{tag}"])
+            h_allowed = ((whip * ip) - bb).where(ip.notna() & np.isfinite(ip) & (ip > 0.0), np.nan)
+
+        sgp_runs = (runs / sgp_den["R"]).fillna(0.0)
+        sgp_hr = (hr / sgp_den["HR"]).fillna(0.0)
+        sgp_rbi = (rbi / sgp_den["RBI"]).fillna(0.0)
+        sgp_sb = (sb / sgp_den["SB"]).fillna(0.0)
+        ab_den = sgp_base["AB0"] + ab
+        avg_after = ((sgp_base["H0"] + h) / ab_den).where(ab_den.abs() > 1e-12, np.nan)
+        sgp_avg = ((avg_after - sgp_base["AVG0"]) / sgp_den["AVG"]).fillna(0.0)
+
+        sgp_w = (w / sgp_den["W"]).fillna(0.0)
+        sgp_sv = (sv / sgp_den["SV"]).fillna(0.0)
+        sgp_so = (so / sgp_den["SO"]).fillna(0.0)
+        ip_den = sgp_base["IP0"] + ip
+        era_after = (((sgp_base["ER0"] + er) * 9.0) / ip_den).where(ip_den.abs() > 1e-12, np.nan)
+        sgp_era = ((sgp_base["ERA0"] - era_after) / sgp_den["ERA"]).fillna(0.0)
+        whip_after = ((sgp_base["BBH0"] + bb + h_allowed) / ip_den).where(
+            ip_den.abs() > 1e-12,
+            np.nan,
+        )
+        sgp_whip = ((sgp_base["WHIP0"] - whip_after) / sgp_den["WHIP"]).fillna(0.0)
+
+        sgp_hit = sgp_runs + sgp_hr + sgp_rbi + sgp_sb + sgp_avg
+        sgp_pitch = sgp_w + sgp_sv + sgp_so + sgp_era + sgp_whip
+        out[f"SGP_hit_proj_{tag}"] = sgp_hit
+        out[f"SGP_pitch_proj_{tag}"] = sgp_pitch
+        out[f"SGP_proj_{tag}"] = sgp_hit + sgp_pitch
+
     if (
         "Points_proj_p25" in out.columns
         and "Points_proj_p75" in out.columns
@@ -2781,6 +3381,31 @@ def _add_derived_points_metrics(df: pd.DataFrame) -> pd.DataFrame:
         out["Points_proj_spread"] = (
             pd.to_numeric(out["Points_proj_p75"], errors="coerce")
             - pd.to_numeric(out["Points_proj_p25"], errors="coerce")
+        )
+    if "Points/PA_proj_p25" in out.columns and "Points/PA_proj_p75" in out.columns:
+        out["Points/PA_proj_spread"] = (
+            pd.to_numeric(out["Points/PA_proj_p75"], errors="coerce")
+            - pd.to_numeric(out["Points/PA_proj_p25"], errors="coerce")
+        )
+    if "Points/IP_proj_p25" in out.columns and "Points/IP_proj_p75" in out.columns:
+        out["Points/IP_proj_spread"] = (
+            pd.to_numeric(out["Points/IP_proj_p75"], errors="coerce")
+            - pd.to_numeric(out["Points/IP_proj_p25"], errors="coerce")
+        )
+    if "SGP_proj_p25" in out.columns and "SGP_proj_p75" in out.columns:
+        out["SGP_proj_spread"] = (
+            pd.to_numeric(out["SGP_proj_p75"], errors="coerce")
+            - pd.to_numeric(out["SGP_proj_p25"], errors="coerce")
+        )
+    if "SGP_hit_proj_p25" in out.columns and "SGP_hit_proj_p75" in out.columns:
+        out["SGP_hit_proj_spread"] = (
+            pd.to_numeric(out["SGP_hit_proj_p75"], errors="coerce")
+            - pd.to_numeric(out["SGP_hit_proj_p25"], errors="coerce")
+        )
+    if "SGP_pitch_proj_p25" in out.columns and "SGP_pitch_proj_p75" in out.columns:
+        out["SGP_pitch_proj_spread"] = (
+            pd.to_numeric(out["SGP_pitch_proj_p75"], errors="coerce")
+            - pd.to_numeric(out["SGP_pitch_proj_p25"], errors="coerce")
         )
     return out
 
@@ -3217,18 +3842,16 @@ def _roster_default_state() -> dict:
     }
 
 
-def _load_roster_manager_saves(path: Path) -> dict:
-    default_payload = {
+def _roster_default_saves_payload() -> dict:
+    return {
         "version": int(ROSTER_MANAGER_SCHEMA_VERSION),
         "updated_at": "",
         "teams": {},
     }
-    if not path.exists():
-        return default_payload
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return default_payload
+
+
+def _roster_normalize_saves_payload(raw: object) -> dict:
+    default_payload = _roster_default_saves_payload()
     if not isinstance(raw, dict):
         return default_payload
     teams = raw.get("teams", {})
@@ -3247,8 +3870,20 @@ def _load_roster_manager_saves(path: Path) -> dict:
     }
 
 
+def _load_roster_manager_saves(path: Path) -> dict:
+    default_payload = _roster_default_saves_payload()
+    if not path.exists():
+        return default_payload
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default_payload
+    return _roster_normalize_saves_payload(raw)
+
+
 def _write_roster_manager_saves(path: Path, payload: dict) -> bool:
     try:
+        payload = _roster_normalize_saves_payload(payload)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = path.with_name(f"{path.name}.tmp")
         tmp_path.write_text(
@@ -4130,6 +4765,137 @@ def _render_projection_styled_table(
         st.dataframe(out, width="stretch", hide_index=True)
 
 
+def _apply_binary_series_operation(
+    left: pd.Series,
+    right: pd.Series,
+    *,
+    op: str,
+) -> pd.Series:
+    if op == "+":
+        return left + right
+    if op == "-":
+        return left - right
+    if op == "*":
+        return left * right
+    if op == "/":
+        denom = right.where(right.abs() > 1e-12, np.nan)
+        return left / denom
+    return pd.Series(np.nan, index=left.index, dtype="float64")
+
+
+def _apply_custom_arithmetic_columns(
+    display_df: pd.DataFrame,
+    stats_source: pd.DataFrame,
+    *,
+    key_prefix: str,
+    table_label: str,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    out_display = display_df.copy()
+    out_stats = stats_source.copy()
+    defs_key = f"{key_prefix}_defs"
+    if not isinstance(st.session_state.get(defs_key), list):
+        st.session_state[defs_key] = []
+    calc_defs = st.session_state.get(defs_key, [])
+
+    numeric_candidates: list[str] = []
+    for col in out_stats.columns:
+        vals = pd.to_numeric(out_stats[col], errors="coerce")
+        if vals.notna().any():
+            numeric_candidates.append(col)
+
+    with st.expander(f"{table_label} calculated columns", expanded=False):
+        st.caption("Create a new column from two numeric columns using +, -, *, or /.")
+        if len(numeric_candidates) < 2:
+            st.info("Need at least two numeric columns to create a calculated column.")
+        else:
+            op_options = ["+", "-", "*", "/"]
+            add_cols = st.columns([2.2, 2.2, 1.0, 2.2, 1.2])
+            with add_cols[0]:
+                new_name = st.text_input(
+                    "New column name",
+                    value="",
+                    key=f"{key_prefix}_new_name",
+                ).strip()
+            with add_cols[1]:
+                left_col = st.selectbox(
+                    "Column A",
+                    numeric_candidates,
+                    key=f"{key_prefix}_left",
+                )
+            with add_cols[2]:
+                op = st.selectbox(
+                    "Op",
+                    op_options,
+                    key=f"{key_prefix}_op",
+                )
+            with add_cols[3]:
+                right_col = st.selectbox(
+                    "Column B",
+                    numeric_candidates,
+                    index=1 if len(numeric_candidates) > 1 else 0,
+                    key=f"{key_prefix}_right",
+                )
+            with add_cols[4]:
+                add_clicked = st.button("Add", key=f"{key_prefix}_add")
+            if add_clicked:
+                if not new_name:
+                    st.warning("Enter a column name.")
+                elif new_name in out_display.columns:
+                    st.warning(f"Column `{new_name}` already exists.")
+                elif any(str(d.get("name", "")) == new_name for d in calc_defs):
+                    st.warning(f"Calculated column `{new_name}` already exists.")
+                else:
+                    calc_defs.append(
+                        {
+                            "name": str(new_name),
+                            "left": str(left_col),
+                            "op": str(op),
+                            "right": str(right_col),
+                        }
+                    )
+                    st.session_state[defs_key] = calc_defs
+                    st.rerun()
+
+        if calc_defs:
+            labels = [
+                f"{d.get('name', 'calc')} = {d.get('left', '?')} {d.get('op', '?')} {d.get('right', '?')}"
+                for d in calc_defs
+            ]
+            rm_cols = st.columns([4.2, 1.3, 1.5])
+            with rm_cols[0]:
+                rm_label = st.selectbox(
+                    "Existing calculated columns",
+                    labels,
+                    key=f"{key_prefix}_rm_label",
+                )
+            rm_idx = labels.index(rm_label) if rm_label in labels else -1
+            with rm_cols[1]:
+                rm_clicked = st.button("Remove", key=f"{key_prefix}_rm_one")
+            with rm_cols[2]:
+                clear_clicked = st.button("Clear all", key=f"{key_prefix}_rm_all")
+            if rm_clicked and rm_idx >= 0:
+                calc_defs.pop(rm_idx)
+                st.session_state[defs_key] = calc_defs
+                st.rerun()
+            if clear_clicked:
+                st.session_state[defs_key] = []
+                st.rerun()
+
+    for d in calc_defs:
+        name = str(d.get("name", "")).strip()
+        left_col = str(d.get("left", "")).strip()
+        right_col = str(d.get("right", "")).strip()
+        op = str(d.get("op", "")).strip()
+        if not name or left_col not in out_stats.columns or right_col not in out_stats.columns:
+            continue
+        left_vals = pd.to_numeric(out_stats[left_col], errors="coerce")
+        right_vals = pd.to_numeric(out_stats[right_col], errors="coerce")
+        result = _apply_binary_series_operation(left_vals, right_vals, op=op)
+        out_stats[name] = result
+        out_display[name] = result
+    return out_display, out_stats
+
+
 def show_table(
     df: pd.DataFrame,
     title: str,
@@ -4208,7 +4974,9 @@ def show_table(
 
         if name_col in df.columns:
             player_names = sorted(df[name_col].dropna().astype(str).unique().tolist())
-            if "hitters" in str(title).strip().lower():
+            title_l = str(title).strip().lower()
+            supports_custom_player_list = ("hitters" in title_l) or ("pitchers" in title_l)
+            if supports_custom_player_list:
                 player_mode = st.selectbox(
                     f"{title} player selection",
                     ["All", "Single", "Custom List"],
@@ -4499,6 +5267,8 @@ def show_table(
         )
         bp_default_order = [
             "Points",
+            "SGP",
+            "Points/PA",
             "PA",
             "AB",
             "H",
@@ -4518,6 +5288,8 @@ def show_table(
         ]
         pitching_default_order = [
             "Points",
+            "SGP",
+            "Points/IP",
             "G",
             "GS",
             "IP",
@@ -4541,6 +5313,8 @@ def show_table(
         ]
         pitcher_kpi_default_order = [
             "Points",
+            "SGP",
+            "Points/IP",
             "TBF",
             "IP",
             "GS",
@@ -4565,6 +5339,8 @@ def show_table(
         ]
         kpi_default_order = [
             "Points",
+            "SGP",
+            "Points/PA",
             "PA",
             "bbe",
             "damage_rate",
@@ -4631,6 +5407,10 @@ def show_table(
         metric_order += [m for m in selected_metrics if m not in metric_order]
 
         sort_options = list(selected_metrics)
+        for metric_name in ["Points/PA", "Points/IP"]:
+            col_name = f"{metric_name}_proj_p50"
+            if col_name in df.columns and metric_name not in sort_options:
+                sort_options.append(metric_name)
         if "ADP" in df.columns:
             sort_options.append("ADP")
         if sort_options and "P50" in pct_choices:
@@ -4680,6 +5460,8 @@ def show_table(
             "team_abbreviations",
             "opening_day_status_40man",
             "is_mlb_ip_source",
+            "is_mlb_pa_source",
+            "is_mlb_sb_source",
             "position",
             "appeared_in_MLB",
         ]
@@ -4692,6 +5474,10 @@ def show_table(
             col = f"{metric}_proj_p50"
             if col in df.columns:
                 show_cols.append(col)
+    for permanent_metric in ["Points/PA", "Points/IP"]:
+        col = f"{permanent_metric}_proj_p50"
+        if col in df.columns and col not in show_cols:
+            show_cols.append(col)
     if ("P25" in pct_choices) or ("P75" in pct_choices):
         for metric in metric_order:
             c25 = f"{metric}_proj_p25"
@@ -4744,6 +5530,13 @@ def show_table(
         display_df = display_df.rename(columns=rename_map)
         stats_source = stats_source.rename(columns=rename_map)
 
+    display_df, stats_source = _apply_custom_arithmetic_columns(
+        display_df,
+        stats_source,
+        key_prefix=f"{key_root}_calc_cols",
+        table_label=title,
+    )
+
     display_df = _apply_column_filters(
         display_df,
         key_prefix=f"{key_root}_table_col_filters",
@@ -4784,6 +5577,231 @@ def show_table(
         stats_source=stats_source,
         metric_bases=metric_order,
     )
+
+
+def _show_all_players_adp_points_view(
+    hitters_df: pd.DataFrame,
+    pitchers_df: pd.DataFrame,
+    *,
+    key_prefix: str = "all_players",
+    compact_ui: bool = False,
+) -> None:
+    st.subheader("All Players (ADP + Points)")
+    if hitters_df.empty and pitchers_df.empty:
+        st.info("No hitter or pitcher projections are available for this view.")
+        return
+
+    def _pick_series(df: pd.DataFrame, candidates: list[str]) -> pd.Series:
+        for col in candidates:
+            if col in df.columns:
+                return df[col]
+        return pd.Series(np.nan, index=df.index, dtype="float64")
+
+    def _build_player_view(df: pd.DataFrame, *, player_type: str) -> pd.DataFrame:
+        if df.empty:
+            return pd.DataFrame()
+        out = _add_derived_points_metrics(df.copy())
+        view = pd.DataFrame(index=out.index)
+        is_pitcher_pool = str(player_type).strip().lower() == "pitcher"
+        raw_name = _pick_series(out, ["hitter_name", "name", "player_name"]).astype(str).str.strip()
+        view["Player"] = raw_name.where(raw_name.ne(""), np.nan)
+        view["Player Type"] = str(player_type)
+        view["ID"] = pd.to_numeric(
+            _pick_series(out, ["batter_mlbid", "pitcher_mlbid", "mlbid"]),
+            errors="coerce",
+        ).astype("Int64")
+        if is_pitcher_pool:
+            pitcher_order = ["SP", "RP"]
+            pos_tokens = out.apply(_roster_pitcher_tokens_from_row, axis=1)
+            pos_text = pos_tokens.map(
+                lambda toks: "/".join(tok for tok in pitcher_order if tok in set(toks))
+            )
+        else:
+            hitter_order = ["C", "1B", "2B", "3B", "SS", "OF", "UT"]
+            pos_tokens = out.apply(_roster_hitter_tokens_from_row, axis=1)
+            pos_text = pos_tokens.map(
+                lambda toks: "/".join(tok for tok in hitter_order if tok in set(toks))
+            )
+        raw_position = _pick_series(out, ["position"]).astype(str).replace({"nan": ""})
+        view["Position"] = pos_text.where(pos_text.astype(str).str.len() > 0, raw_position)
+        team_vals = _pick_series(out, ["team", "team_abbreviations", "team_abbreviation"]).astype(str)
+        view["Team"] = team_vals.replace({"nan": ""})
+        view["ADP"] = pd.to_numeric(_pick_series(out, ["ADP"]), errors="coerce")
+        if "Pick" in out.columns:
+            view["Pick"] = out["Pick"].astype(str).replace({"nan": ""})
+        else:
+            view["Pick"] = view["ADP"].map(_adp_to_pick_notation)
+        view["PA_proj_p50"] = pd.to_numeric(_pick_series(out, ["PA_proj_p50"]), errors="coerce")
+        view["IP_proj_p50"] = pd.to_numeric(
+            _pick_series(out, ["IP_proj_p50", "IP_marcel_proj_p50"]),
+            errors="coerce",
+        )
+        for tag in ("p25", "p50", "p75"):
+            col = f"Points_proj_{tag}"
+            view[col] = pd.to_numeric(_pick_series(out, [col]), errors="coerce")
+            sgp_col = f"SGP_proj_{tag}"
+            view[sgp_col] = pd.to_numeric(_pick_series(out, [sgp_col]), errors="coerce")
+            ppa_col = f"Points/PA_proj_{tag}"
+            pip_col = f"Points/IP_proj_{tag}"
+            view[ppa_col] = pd.to_numeric(_pick_series(out, [ppa_col]), errors="coerce")
+            view[pip_col] = pd.to_numeric(_pick_series(out, [pip_col]), errors="coerce")
+        return view[view["Player"].notna()].copy()
+
+    hitters_view = _build_player_view(hitters_df, player_type="Hitter")
+    pitchers_view = _build_player_view(pitchers_df, player_type="Pitcher")
+    combined = pd.concat([hitters_view, pitchers_view], ignore_index=True)
+    if combined.empty:
+        st.info("No player rows available for ADP/Points view.")
+        return
+
+    player_type_opts = ["Hitter", "Pitcher"]
+    selected_types = st.multiselect(
+        "Player type",
+        player_type_opts,
+        default=player_type_opts,
+        key=f"{key_prefix}_player_types",
+    )
+    if selected_types:
+        combined = combined[combined["Player Type"].isin(selected_types)].copy()
+
+    player_query = st.text_input(
+        "Player search",
+        value="",
+        key=f"{key_prefix}_player_search",
+    ).strip()
+    if player_query:
+        combined = combined[
+            combined["Player"].astype(str).str.contains(player_query, case=False, na=False)
+        ].copy()
+
+    sort_cols = st.columns(3)
+    with sort_cols[0]:
+        points_pct = st.selectbox(
+            "Points percentile",
+            ["P25", "P50", "P75"],
+            index=1,
+            key=f"{key_prefix}_points_pct",
+        )
+    sort_metric_opts = [
+        f"Points ({points_pct})",
+        f"SGP ({points_pct})",
+        f"Points/PA ({points_pct})",
+        f"Points/IP ({points_pct})",
+        "ADP",
+    ]
+    with sort_cols[1]:
+        sort_metric = st.selectbox(
+            "Sort by",
+            sort_metric_opts,
+            index=0,
+            key=f"{key_prefix}_sort_metric",
+        )
+    with sort_cols[2]:
+        sort_dir_default_idx = 1 if sort_metric == "ADP" else 0
+        sort_direction = st.selectbox(
+            "Sort direction",
+            ["Descending", "Ascending"],
+            index=sort_dir_default_idx,
+            key=f"{key_prefix}_sort_direction",
+        )
+
+    pct_tag = str(points_pct).lower()
+    sort_map = {
+        f"Points ({points_pct})": f"Points_proj_{pct_tag}",
+        f"SGP ({points_pct})": f"SGP_proj_{pct_tag}",
+        f"Points/PA ({points_pct})": f"Points/PA_proj_{pct_tag}",
+        f"Points/IP ({points_pct})": f"Points/IP_proj_{pct_tag}",
+        "ADP": "ADP",
+    }
+    sort_col = sort_map.get(str(sort_metric), f"Points_proj_{pct_tag}")
+    if sort_col in combined.columns:
+        combined = combined.sort_values(
+            sort_col,
+            ascending=(sort_direction == "Ascending"),
+            na_position="last",
+        )
+
+    if combined.empty:
+        st.info("No rows after filters. Clear one or more filters to view data.")
+        return
+
+    display_cols = [
+        "Player",
+        "Player Type",
+        "Position",
+        "Team",
+        "ID",
+        "ADP",
+        "Pick",
+        "SGP_proj_p25",
+        "SGP_proj_p50",
+        "SGP_proj_p75",
+        "Points_proj_p25",
+        "Points_proj_p50",
+        "Points_proj_p75",
+        "Points/PA_proj_p50",
+        "Points/IP_proj_p50",
+        "PA_proj_p50",
+        "IP_proj_p50",
+    ]
+    display_cols = [c for c in display_cols if c in combined.columns]
+    display_df = combined[display_cols].copy()
+    display_df = display_df.rename(
+        columns={
+            "SGP_proj_p25": "SGP P25",
+            "SGP_proj_p50": "SGP P50",
+            "SGP_proj_p75": "SGP P75",
+            "Points_proj_p25": "Points P25",
+            "Points_proj_p50": "Points P50",
+            "Points_proj_p75": "Points P75",
+            "Points/PA_proj_p50": "Points/PA P50",
+            "Points/IP_proj_p50": "Points/IP P50",
+            "PA_proj_p50": "PA P50",
+            "IP_proj_p50": "IP P50",
+        }
+    )
+    display_df, _ = _apply_custom_arithmetic_columns(
+        display_df,
+        display_df.copy(),
+        key_prefix=f"{key_prefix}_calc_cols",
+        table_label="All Players",
+    )
+
+    display_df = _apply_column_filters(
+        display_df,
+        key_prefix=f"{key_prefix}_table_col_filters",
+        expander_label="All Players column filters",
+    )
+    if display_df.empty:
+        st.info("No rows after column filters. Clear one or more filters to view data.")
+        return
+
+    total_rows = len(display_df)
+    rows_default_idx = 3 if compact_ui else 2
+    page_size_choice = st.selectbox(
+        "All Players rows per page",
+        ["All", 50, 100, 200, 500],
+        index=rows_default_idx,
+        key=f"{key_prefix}_rows_per_page",
+    )
+    if page_size_choice == "All":
+        page_df = display_df
+    else:
+        page_size = int(page_size_choice)
+        total_pages = max(1, int(np.ceil(total_rows / page_size)))
+        page = st.number_input(
+            "All Players page",
+            min_value=1,
+            max_value=total_pages,
+            value=1,
+            step=1,
+            key=f"{key_prefix}_page_num",
+        )
+        start = (int(page) - 1) * page_size
+        end = start + page_size
+        page_df = display_df.iloc[start:end].copy()
+
+    st.dataframe(_apply_custom_rounding(page_df), width="stretch", hide_index=True)
 
 
 def _show_two_stage_before_after(
@@ -5649,6 +6667,60 @@ def show_roster_manager(
             st.session_state[state_key] = _roster_default_state()
             _roster_reset_ui_widget_state(key_prefix)
             st.rerun()
+
+    backup_cols = st.columns([1, 1, 2])
+    with backup_cols[0]:
+        export_payload = _roster_normalize_saves_payload(saves_payload)
+        st.download_button(
+            "Download saves JSON",
+            data=json.dumps(export_payload, ensure_ascii=True, indent=2, sort_keys=True),
+            file_name="roster_manager_saved_teams.json",
+            mime="application/json",
+            key=f"{key_prefix}_download_saves_json",
+        )
+    with backup_cols[1]:
+        uploaded_saves_file = st.file_uploader(
+            "Import saves JSON",
+            type=["json"],
+            key=f"{key_prefix}_upload_saves_json",
+            label_visibility="collapsed",
+        )
+    with backup_cols[2]:
+        import_mode = st.radio(
+            "Import mode",
+            options=["Merge", "Replace"],
+            index=0,
+            horizontal=True,
+            key=f"{key_prefix}_import_mode",
+            help="Merge keeps existing saves and adds/replaces matching team names. Replace overwrites all saves.",
+        )
+        if st.button("Import uploaded JSON", key=f"{key_prefix}_import_saves_btn"):
+            if uploaded_saves_file is None:
+                st.warning("Upload a JSON file first.")
+            else:
+                try:
+                    raw_import = json.loads(uploaded_saves_file.getvalue().decode("utf-8"))
+                    imported_payload = _roster_normalize_saves_payload(raw_import)
+                except Exception:
+                    st.error("Uploaded file is not a valid roster saves JSON.")
+                    imported_payload = None
+                if imported_payload is not None:
+                    if import_mode == "Replace":
+                        out_payload = imported_payload
+                    else:
+                        out_payload = _load_roster_manager_saves(ROSTER_MANAGER_SAVE_PATH)
+                        merged = dict(out_payload.get("teams", {}))
+                        merged.update(dict(imported_payload.get("teams", {})))
+                        out_payload["teams"] = merged
+                    out_payload["updated_at"] = _roster_now_iso()
+                    if _write_roster_manager_saves(ROSTER_MANAGER_SAVE_PATH, out_payload):
+                        st.success(
+                            f"Imported {len((imported_payload.get('teams') or {}))} teams "
+                            f"({import_mode.lower()} mode)."
+                        )
+                        st.rerun()
+                    else:
+                        st.error("Failed to write imported saves to disk.")
 
     def _starter_candidate_ids(slot: str, *, hitter: bool, current_id: int | None) -> list[int]:
         blocked = _roster_selected_player_ids(state)
@@ -6745,78 +7817,94 @@ def _run_projection_sandbox() -> None:
     )
     _apply_compact_ui_chrome(compact_ui)
 
-    source_options = {
-        "KPI Projections (Individual Stat Skills)": {
-            "hitters": Path("projection_outputs/sandbox/kpi_projections_2026.parquet"),
-            "pitchers": Path("projection_outputs/sandbox/pitcher_kpi_projections_2026.parquet"),
-            "backtest": None,
-        },
-        "Traditional Two-Stage (KPI Adjusted, p50)": {
-            "hitters": Path("projection_outputs/sandbox/traditional_two_stage_projections_2026.parquet"),
-            "pitchers": None,
-            "backtest": None,
-        },
-        "Two Stage KPI Projections, Pitchers": {
-            "hitters": Path("projection_outputs/sandbox/traditional_two_stage_projections_2026.parquet"),
-            "pitchers": Path("projection_outputs/sandbox/two_stage_kpi_pitcher_projections_2026.parquet"),
-            "backtest": None,
-        },
+    hitter_source_options = {
+        "Traditional Two-Stage (KPI Adjusted, p50)": Path(
+            "projection_outputs/sandbox/traditional_two_stage_projections_2026.parquet"
+        ),
+        "KPI Projections (Individual Stat Skills)": Path(
+            "projection_outputs/sandbox/kpi_projections_2026.parquet"
+        ),
     }
-    source_label = st.selectbox(
-        "Projection source",
-        list(source_options.keys()),
-        index=0,
-        help="LB2 Refreshed uses observed baseball_age joined from lb2_player_season_metadata.",
-    )
-    source_key = "".join(ch if ch.isalnum() else "_" for ch in str(source_label)).strip("_").lower()
-    source_cfg = source_options[source_label]
-    hitters_path = source_cfg["hitters"]
-    pitchers_path = source_cfg["pitchers"]
-    backtest_path = source_cfg["backtest"]
-    st.caption(
-        "Reading projections from: "
-        f"`{hitters_path}`"
-        + (f" | `{pitchers_path}`" if pitchers_path else "")
-        + (f" | `{backtest_path}`" if backtest_path else "")
-    )
+    pitcher_source_options = {
+        "Two Stage KPI Projections, Pitchers": Path(
+            "projection_outputs/sandbox/two_stage_kpi_pitcher_projections_2026.parquet"
+        ),
+        "Two Stage KPI Projections, Pitchers (3/1/1 Recency)": Path(
+            "projection_outputs/sandbox/two_stage_kpi_pitcher_projections_2026_recency_3_1_1.parquet"
+        ),
+        "KPI Projections (Individual Stat Skills)": Path(
+            "projection_outputs/sandbox/pitcher_kpi_projections_2026.parquet"
+        ),
+        "KPI Projections (Individual Stat Skills, Pitchers 3/1/1 Recency)": Path(
+            "projection_outputs/sandbox/pitcher_kpi_projections_2026_recency_3_1_1.parquet"
+        ),
+    }
+    hitter_source_state_key = "projection_sandbox_hitter_source"
+    pitcher_source_state_key = "projection_sandbox_pitcher_source"
+    hitter_source_labels = list(hitter_source_options.keys())
+    pitcher_source_labels = list(pitcher_source_options.keys())
+
+    if st.session_state.get(hitter_source_state_key) not in hitter_source_options:
+        st.session_state[hitter_source_state_key] = hitter_source_labels[0]
+    if st.session_state.get(pitcher_source_state_key) not in pitcher_source_options:
+        st.session_state[pitcher_source_state_key] = pitcher_source_labels[0]
+
+    selected_hitter_source = str(st.session_state[hitter_source_state_key])
+    selected_pitcher_source = str(st.session_state[pitcher_source_state_key])
+    hitters_path = hitter_source_options[selected_hitter_source]
+    pitchers_path = pitcher_source_options[selected_pitcher_source]
+    backtest = pd.DataFrame()
+
+    def _source_slug(*parts: str) -> str:
+        raw = "_".join(str(p) for p in parts if p)
+        out = "".join(ch if ch.isalnum() else "_" for ch in raw).strip("_").lower()
+        return out or "projection_sandbox"
+
+    source_combo_key = _source_slug(selected_hitter_source, selected_pitcher_source)
 
     hitters = load_projection(hitters_path)
-    pitchers = load_projection(pitchers_path) if pitchers_path else pd.DataFrame()
-    backtest = load_projection(backtest_path) if backtest_path else pd.DataFrame()
     hitters = _attach_source_season_mlb_pa(hitters)
     hitters = _attach_hitter_position_counts(hitters)
-    pitchers = _attach_source_season_mlb_pa(pitchers)
-    base_traditional = (
-        load_projection(Path("projection_outputs/sandbox/traditional_projections_2026.parquet"))
-        if source_label == "Traditional Two-Stage (KPI Adjusted, p50)"
-        else pd.DataFrame()
-    )
-    base_traditional = _attach_source_season_mlb_pa(base_traditional)
-    base_traditional = _attach_hitter_position_counts(base_traditional)
-    component_slash_hist = load_projection(COMPONENT_SLASH_PREDICTIONS_PATH)
-    component_slash_kpi = load_projection(COMPONENT_SLASH_KPI_PROJECTIONS_PATH)
-    component_slash_kpi = _attach_hitter_position_counts(component_slash_kpi)
-
     if not hitters.empty:
         if "hitter_name" not in hitters.columns and "player_name" in hitters.columns:
             hitters = hitters.assign(hitter_name=hitters["player_name"])
         if "batter_mlbid" not in hitters.columns and "mlbid" in hitters.columns:
             hitters = hitters.assign(batter_mlbid=hitters["mlbid"])
+    hitters = _attach_40man_context(hitters, for_pitchers=False)
+    hitters = _attach_adp_context(hitters, for_pitchers=False)
+
+    pitchers = load_projection(pitchers_path)
+    pitchers = _attach_source_season_mlb_pa(pitchers)
     if not pitchers.empty:
         if "name" not in pitchers.columns and "player_name" in pitchers.columns:
             pitchers = pitchers.assign(name=pitchers["player_name"])
         if "pitcher_mlbid" not in pitchers.columns and "mlbid" in pitchers.columns:
             pitchers = pitchers.assign(pitcher_mlbid=pitchers["mlbid"])
-
-    hitters = _attach_40man_context(hitters, for_pitchers=False)
     pitchers = _attach_40man_context(pitchers, for_pitchers=True)
-    hitters = _attach_adp_context(hitters, for_pitchers=False)
     pitchers = _attach_adp_context(pitchers, for_pitchers=True)
+
+    show_before_after = selected_hitter_source == "Traditional Two-Stage (KPI Adjusted, p50)"
+    base_traditional = (
+        load_projection(Path("projection_outputs/sandbox/traditional_projections_2026.parquet"))
+        if show_before_after
+        else pd.DataFrame()
+    )
+    base_traditional = _attach_source_season_mlb_pa(base_traditional)
+    base_traditional = _attach_hitter_position_counts(base_traditional)
+
+    component_slash_hist = load_projection(COMPONENT_SLASH_PREDICTIONS_PATH)
+    component_slash_kpi = load_projection(COMPONENT_SLASH_KPI_PROJECTIONS_PATH)
+    component_slash_kpi = _attach_hitter_position_counts(component_slash_kpi)
+
+    st.caption(
+        "Auto-loaded projection sources: "
+        f"Hitters=`{hitters_path}` | Pitchers=`{pitchers_path}`"
+    )
 
     enable_role_edit_mode = st.checkbox(
         "Enable edit mode (pitcher Opening Day role overrides)",
         value=False,
-        key=f"{source_key}_enable_pitcher_role_edit_mode",
+        key=f"{source_combo_key}_enable_pitcher_role_edit_mode",
         help=(
             "Lets you override Opening Day role for individual pitchers in this session. "
             "Overrides feed into role-based IP blending and saves redistribution."
@@ -6826,7 +7914,7 @@ def _run_projection_sandbox() -> None:
         with st.expander("Edit mode: pitcher Opening Day roles", expanded=False):
             pitchers, edit_summary = _apply_pitcher_role_overrides_edit_mode(
                 pitchers,
-                key_prefix=source_key,
+                key_prefix=source_combo_key,
             )
         st.caption(
             "Edit mode overrides: "
@@ -6834,12 +7922,12 @@ def _run_projection_sandbox() -> None:
             f"rows impacted={edit_summary.get('rows_overridden', 0)}"
         )
 
-    role_apply_cols = st.columns(3)
+    role_apply_cols = st.columns(5)
     with role_apply_cols[0]:
         apply_role_pt = st.checkbox(
             "Apply 40-man role PA/IP blend",
             value=True,
-            key=f"{source_key}_apply_40man_role_pt",
+            key=f"{source_combo_key}_apply_40man_role_pt",
             help=(
                 "For each Opening Day Status role, computes mean projected PA/IP and "
                 "replaces each player p50 volume with the average of player p50 and role mean."
@@ -6849,7 +7937,7 @@ def _run_projection_sandbox() -> None:
         apply_sv_redistribution = st.checkbox(
             "Redistribute saves by bullpen role",
             value=True,
-            key=f"{source_key}_apply_40man_sv_redist",
+            key=f"{source_combo_key}_apply_40man_sv_redist",
             help=(
                 "Sets team saves from 2023-2025 mean/stdev inputs "
                 f"(mean={TEAM_SV_MEAN:.1f}, sd={TEAM_SV_STD:.1f}) and redistributes "
@@ -6860,10 +7948,31 @@ def _run_projection_sandbox() -> None:
         apply_team_ip_source = st.checkbox(
             "Apply MLB IP source allocator",
             value=True,
-            key=f"{source_key}_apply_mlb_ip_source_allocator",
+            key=f"{source_combo_key}_apply_mlb_ip_source_allocator",
             help=(
                 "Allocates MLB pitching volume by Opening Day role hierarchy with team caps "
                 "(IP clipped to 1400-1470, GS=162; G unconstrained), and flags source rows."
+            ),
+        )
+    with role_apply_cols[3]:
+        apply_hitter_pa_source = st.checkbox(
+            "Apply MLB PA source allocator",
+            value=True,
+            key=f"{source_combo_key}_apply_mlb_pa_source_allocator",
+            help=(
+                "Allocates MLB hitter PA by Opening Day role hierarchy with team caps "
+                f"(PA clipped to {int(TEAM_PA_MIN)}-{int(TEAM_PA_MAX)}), and flags source rows."
+            ),
+        )
+    with role_apply_cols[4]:
+        apply_hitter_sb_source = st.checkbox(
+            "Apply MLB SB/SBA source allocator",
+            value=True,
+            key=f"{source_combo_key}_apply_mlb_sb_sba_source_allocator",
+            help=(
+                "Reallocates hitter SB/SBA projections by Opening Day Status priority so "
+                f"league totals match 2025 MLB targets (SB={int(MLB_SB_TARGET_2025)}, "
+                f"SBA={int(MLB_SBA_TARGET_2025)})."
             ),
         )
 
@@ -6911,66 +8020,97 @@ def _run_projection_sandbox() -> None:
             f"team IP mean={ip_mu_txt}, sd={ip_sd_txt}, "
             f"team G mean={g_mu_txt}, team GS mean={gs_mu_txt}"
         )
-
-    if (
-        source_label
-        not in {
-            "Traditional Projection (BP Rates + MLB PA Variability)",
-            "Traditional Two-Stage (KPI Adjusted, p50)",
-            "Traditional Composite (Metric Experts)",
-        }
-        and not hitters.empty
-        and "age_source" in hitters.columns
-    ):
-        hit_age = hitters["age_source"].value_counts(dropna=False).to_dict()
-        pit_age = (
-            pitchers["age_source"].value_counts(dropna=False).to_dict()
-            if not pitchers.empty and "age_source" in pitchers.columns
-            else {}
+    if bool(apply_hitter_pa_source):
+        hitters, pa_src_summary = _apply_team_mlb_pa_source_allocation(hitters)
+        pa_mu = pa_src_summary.get("team_pa_mean")
+        pa_sd = pa_src_summary.get("team_pa_sd")
+        pa_min = pa_src_summary.get("team_pa_min")
+        pa_max = pa_src_summary.get("team_pa_max")
+        pa_mu_txt = "n/a" if (pa_mu is None or not np.isfinite(float(pa_mu))) else f"{float(pa_mu):.1f}"
+        pa_sd_txt = "n/a" if (pa_sd is None or not np.isfinite(float(pa_sd))) else f"{float(pa_sd):.1f}"
+        pa_min_txt = "n/a" if (pa_min is None or not np.isfinite(float(pa_min))) else f"{float(pa_min):.1f}"
+        pa_max_txt = "n/a" if (pa_max is None or not np.isfinite(float(pa_max))) else f"{float(pa_max):.1f}"
+        st.caption(
+            "MLB PA source allocator applied: "
+            f"teams adjusted={pa_src_summary.get('teams_adjusted', 0)}, "
+            f"rows selected={pa_src_summary.get('rows_selected', 0)}, "
+            f"team PA mean={pa_mu_txt}, sd={pa_sd_txt}, "
+            f"min={pa_min_txt}, max={pa_max_txt}"
         )
-        st.caption(f"Age source summary - Hitters: {hit_age} | Pitchers: {pit_age}")
+    if bool(apply_hitter_sb_source):
+        hitters, sb_src_summary = _apply_hitter_mlb_sb_sba_source_allocation(
+            hitters,
+            target_sb_total=float(MLB_SB_TARGET_2025),
+            target_sba_total=float(MLB_SBA_TARGET_2025),
+        )
+        sb_tot = sb_src_summary.get("sb_total_p50")
+        sba_tot = sb_src_summary.get("sba_total_p50")
+        sb_txt = "n/a" if (sb_tot is None or not np.isfinite(float(sb_tot))) else f"{float(sb_tot):.0f}"
+        sba_txt = "n/a" if (sba_tot is None or not np.isfinite(float(sba_tot))) else f"{float(sba_tot):.0f}"
+        st.caption(
+            "MLB SB/SBA source allocator applied: "
+            f"rows selected={sb_src_summary.get('rows_selected', 0)}, "
+            f"SB p50 total={sb_txt}, SBA p50 total={sba_txt}"
+        )
 
-    hide_cols_for_source: set[str] = set()
-    if source_label in {
-        "Traditional Projection (BP Rates + MLB PA Variability)",
-        "Traditional Two-Stage (KPI Adjusted, p50)",
-        "Traditional Composite (Metric Experts)",
-    }:
-        hide_cols_for_source = {"age_source", "source_season"}
-    prefer_kpi_defaults = source_label in {
+    hide_cols_hitters: set[str] = set()
+    if selected_hitter_source == "Traditional Two-Stage (KPI Adjusted, p50)":
+        hide_cols_hitters = {"age_source", "source_season"}
+    hide_cols_pitchers: set[str] = set()
+    prefer_kpi_hitters = selected_hitter_source == "KPI Projections (Individual Stat Skills)"
+    prefer_kpi_pitchers = selected_pitcher_source in {
         "KPI Projections (Individual Stat Skills)",
-        "LB2 Refreshed (Observed Age)",
-        "Legacy (Global Imputed Age)",
+        "KPI Projections (Individual Stat Skills, Pitchers 3/1/1 Recency)",
     }
-    tab_labels = ["Hitters", "Pitchers", "Backtest"]
-    show_before_after = source_label == "Traditional Two-Stage (KPI Adjusted, p50)"
+
+    tab_labels = ["Hitters", "Pitchers", "All Players", "Backtest"]
     if show_before_after:
         tab_labels.append("Before vs After")
     tab_labels.append("Component Slash")
     tabs = st.tabs(tab_labels)
+
     with tabs[0]:
+        st.selectbox(
+            "Hitters projection source",
+            hitter_source_labels,
+            key=hitter_source_state_key,
+            help="Default auto-load is hitter two-stage. Switch to KPI hitters if needed.",
+        )
         show_table(
             hitters,
             "Hitters",
             "hitter_name",
             "batter_mlbid",
-            key_prefix=f"{source_key}_hitters",
-            hide_display_cols=hide_cols_for_source,
-            prefer_kpi_defaults=prefer_kpi_defaults,
+            key_prefix=f"{source_combo_key}_hitters",
+            hide_display_cols=hide_cols_hitters,
+            prefer_kpi_defaults=prefer_kpi_hitters,
             compact_ui=compact_ui,
         )
     with tabs[1]:
+        st.selectbox(
+            "Pitchers projection source",
+            pitcher_source_labels,
+            key=pitcher_source_state_key,
+            help="Default auto-load is pitcher two-stage. Switch to KPI pitchers if needed.",
+        )
         show_table(
             pitchers,
             "Pitchers",
             "name",
             "pitcher_mlbid",
-            key_prefix=f"{source_key}_pitchers",
-            hide_display_cols=hide_cols_for_source,
-            prefer_kpi_defaults=prefer_kpi_defaults,
+            key_prefix=f"{source_combo_key}_pitchers",
+            hide_display_cols=hide_cols_pitchers,
+            prefer_kpi_defaults=prefer_kpi_pitchers,
             compact_ui=compact_ui,
         )
     with tabs[2]:
+        _show_all_players_adp_points_view(
+            hitters,
+            pitchers,
+            key_prefix=f"{source_combo_key}_all_players",
+            compact_ui=compact_ui,
+        )
+    with tabs[3]:
         st.subheader("Backtest Summary")
         if backtest.empty:
             st.info("Missing projection_backtest_summary.parquet")
@@ -6978,7 +8118,7 @@ def _run_projection_sandbox() -> None:
             backtest_df = backtest.copy()
             backtest_df = _apply_column_filters(
                 backtest_df,
-                key_prefix=f"{source_key}_backtest_col_filters",
+                key_prefix=f"{source_combo_key}_backtest_col_filters",
                 expander_label="Backtest column filters",
             )
             if backtest_df.empty:
@@ -6986,17 +8126,21 @@ def _run_projection_sandbox() -> None:
             else:
                 backtest_df = _apply_custom_rounding(backtest_df)
                 st.dataframe(backtest_df, width="stretch", hide_index=True)
-    comp_tab_idx = 3
+    comp_tab_idx = 4
     if show_before_after:
-        with tabs[3]:
+        with tabs[4]:
             _show_two_stage_before_after(
                 hitters,
                 base_traditional,
-                key_prefix=f"{source_key}_before_after",
+                key_prefix=f"{source_combo_key}_before_after",
             )
-        comp_tab_idx = 4
+        comp_tab_idx = 5
     with tabs[comp_tab_idx]:
-        show_component_slash_predictions(component_slash_hist, component_slash_kpi)
+        show_component_slash_predictions(
+            component_slash_hist,
+            component_slash_kpi,
+            key_prefix=f"{source_combo_key}_component_slash",
+        )
 
 
 
@@ -7043,9 +8187,16 @@ def _run_roster_manager_interface() -> None:
         cut_share=0.33,
     )
     roster_pitchers, _ = _apply_team_mlb_ip_source_allocation(roster_pitchers)
+    roster_hitters, _ = _apply_team_mlb_pa_source_allocation(roster_hitters)
+    roster_hitters, _ = _apply_hitter_mlb_sb_sba_source_allocation(
+        roster_hitters,
+        target_sb_total=float(MLB_SB_TARGET_2025),
+        target_sba_total=float(MLB_SBA_TARGET_2025),
+    )
     st.caption(
         "Applied default Projection Sandbox adjustments: role blend, saves redistribution, "
-        "projected IL volume cut (33%), and MLB IP source allocation."
+        "projected IL volume cut (33%), MLB IP source allocation, MLB PA source allocation, "
+        "and MLB SB/SBA source allocation."
     )
 
     show_roster_manager(
