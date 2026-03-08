@@ -6574,9 +6574,94 @@ def show_roster_manager(
     st.session_state[state_key] = live_state
     state = st.session_state[state_key]
 
-    saves_payload = _load_roster_manager_saves(ROSTER_MANAGER_SAVE_PATH)
-    saved_names = sorted((saves_payload.get("teams") or {}).keys())
-    top_cols = st.columns([1, 1, 1, 2])
+    widget_sync_pending_key = f"{key_prefix}_external_widget_sync_pending"
+
+    def _prime_widget_state_from_roster_state() -> None:
+        starters = state.get("starters", {}) if isinstance(state.get("starters"), dict) else {}
+        starter_pct = (
+            state.get("starter_percentiles", {})
+            if isinstance(state.get("starter_percentiles"), dict)
+            else {}
+        )
+        starter_manual = (
+            state.get("starter_manual_stats", {})
+            if isinstance(state.get("starter_manual_stats"), dict)
+            else {}
+        )
+        default_pct_local = _roster_norm_percentile(state.get("default_percentile", "p50"))
+        for slot in ROSTER_HITTER_STARTER_SLOTS:
+            st.session_state[f"{key_prefix}_starter_h_{slot}"] = _roster_parse_int(starters.get(slot))
+            st.session_state[f"{key_prefix}_starter_h_pct_{slot}"] = _roster_norm_percentile(
+                starter_pct.get(slot),
+                default=default_pct_local,
+            )
+            st.session_state[f"{key_prefix}_starter_h_manual_toggle_{slot}"] = (
+                _roster_normalize_manual_stats(starter_manual.get(slot), hitter=True) is not None
+            )
+        for slot in ROSTER_PITCHER_STARTER_SLOTS:
+            st.session_state[f"{key_prefix}_starter_p_{slot}"] = _roster_parse_int(starters.get(slot))
+            st.session_state[f"{key_prefix}_starter_p_pct_{slot}"] = _roster_norm_percentile(
+                starter_pct.get(slot),
+                default=default_pct_local,
+            )
+            st.session_state[f"{key_prefix}_starter_p_manual_toggle_{slot}"] = (
+                _roster_normalize_manual_stats(starter_manual.get(slot), hitter=False) is not None
+            )
+
+        for idx, row in enumerate(state.get("hitter_reserves", [])):
+            row_dict = row if isinstance(row, dict) else {"player_id": row}
+            row_id = str(row_dict.get("row_id") or f"hres_{idx+1}").strip() or f"hres_{idx+1}"
+            st.session_state[f"{key_prefix}_hres_pick_{row_id}"] = _roster_parse_int(
+                row_dict.get("player_id")
+            )
+            st.session_state[f"{key_prefix}_hres_pct_{row_id}"] = _roster_norm_percentile(
+                row_dict.get("percentile"),
+                default=default_pct_local,
+            )
+            st.session_state[f"{key_prefix}_hres_manual_toggle_{row_id}"] = (
+                _roster_normalize_manual_stats(row_dict.get("manual_stats"), hitter=True) is not None
+            )
+
+        for idx, row in enumerate(state.get("pitcher_reserves", [])):
+            row_dict = row if isinstance(row, dict) else {"player_id": row}
+            row_id = str(row_dict.get("row_id") or f"pres_{idx+1}").strip() or f"pres_{idx+1}"
+            st.session_state[f"{key_prefix}_pres_pick_{row_id}"] = _roster_parse_int(
+                row_dict.get("player_id")
+            )
+            st.session_state[f"{key_prefix}_pres_pct_{row_id}"] = _roster_norm_percentile(
+                row_dict.get("percentile"),
+                default=default_pct_local,
+            )
+            st.session_state[f"{key_prefix}_pres_manual_toggle_{row_id}"] = (
+                _roster_normalize_manual_stats(row_dict.get("manual_stats"), hitter=False) is not None
+            )
+
+    if bool(st.session_state.get(widget_sync_pending_key, False)):
+        _roster_reset_ui_widget_state(key_prefix)
+        _prime_widget_state_from_roster_state()
+        st.session_state[widget_sync_pending_key] = False
+
+    loaded_file_name_key = f"{key_prefix}_external_loaded_file_name"
+    export_file_name_key = f"{key_prefix}_external_export_file_name"
+    export_name_synced_from_key = f"{key_prefix}_external_export_name_synced_from"
+    load_notice_key = f"{key_prefix}_external_load_notice"
+    loaded_file_name = str(st.session_state.get(loaded_file_name_key, "") or "").strip()
+    last_synced_loaded_name = str(
+        st.session_state.get(export_name_synced_from_key, "") or ""
+    ).strip()
+    if msg := str(st.session_state.pop(load_notice_key, "") or "").strip():
+        st.success(msg)
+    if export_file_name_key not in st.session_state:
+        st.session_state[export_file_name_key] = loaded_file_name or "roster_manager_roster.json"
+        st.session_state[export_name_synced_from_key] = loaded_file_name
+    elif loaded_file_name and (loaded_file_name != last_synced_loaded_name):
+        st.session_state[export_file_name_key] = loaded_file_name
+        st.session_state[export_name_synced_from_key] = loaded_file_name
+    elif (not loaded_file_name) and (not str(st.session_state.get(export_file_name_key, "") or "").strip()):
+        st.session_state[export_file_name_key] = "roster_manager_roster.json"
+        st.session_state[export_name_synced_from_key] = ""
+
+    top_cols = st.columns([1, 1, 2])
     with top_cols[0]:
         default_pct_choice = st.selectbox(
             "Default percentile",
@@ -6590,137 +6675,90 @@ def show_roster_manager(
     state["default_percentile"] = _roster_norm_percentile(default_pct_choice)
     state["percentile"] = state["default_percentile"]
     with top_cols[1]:
-        selected_save_name = st.selectbox(
-            "Saved team",
-            ["(None)"] + saved_names,
-            index=0,
-            key=f"{key_prefix}_save_name_select",
+        uploaded_roster_file = st.file_uploader(
+            "Load roster JSON",
+            type=["json"],
+            key=f"{key_prefix}_upload_roster_json",
         )
     with top_cols[2]:
-        save_team_name = st.text_input(
-            "Team name",
-            value="",
-            key=f"{key_prefix}_save_name_input",
-            placeholder="My 50-man roster",
+        save_file_name_input = st.text_input(
+            "Save file name",
+            key=export_file_name_key,
+            placeholder="my_roster.json",
         )
-    with top_cols[3]:
-        st.caption(
-            f"Save file: `{ROSTER_MANAGER_SAVE_PATH}` | last updated: "
-            f"{str(saves_payload.get('updated_at', '') or 'n/a')}"
-        )
+        if loaded_file_name:
+            st.caption(f"Loaded file: `{loaded_file_name}`")
+        else:
+            st.caption("Loaded file: none")
 
-    action_cols = st.columns(4)
+    save_file_name = str(save_file_name_input or "").strip() or "roster_manager_roster.json"
+    if not save_file_name.lower().endswith(".json"):
+        save_file_name = f"{save_file_name}.json"
+
+    action_cols = st.columns([1, 1, 1])
     with action_cols[0]:
-        if st.button("Save team", key=f"{key_prefix}_save_btn"):
-            nm = str(save_team_name or "").strip()
-            if not nm:
-                st.warning("Enter a team name before saving.")
+        if st.button("Load uploaded roster", key=f"{key_prefix}_load_uploaded_btn"):
+            if uploaded_roster_file is None:
+                st.warning("Upload a JSON roster file first.")
             else:
-                out_payload = _load_roster_manager_saves(ROSTER_MANAGER_SAVE_PATH)
-                teams = out_payload.get("teams", {})
-                if not isinstance(teams, dict):
-                    teams = {}
-                teams[nm] = _serialize_roster_state(state)
-                out_payload["teams"] = teams
-                out_payload["updated_at"] = _roster_now_iso()
-                if _write_roster_manager_saves(ROSTER_MANAGER_SAVE_PATH, out_payload):
-                    st.success(f"Saved roster `{nm}`.")
-                else:
-                    st.error("Failed to write roster save file.")
+                compat_team_name: str | None = None
+                try:
+                    raw_import = json.loads(uploaded_roster_file.getvalue().decode("utf-8"))
+                except Exception:
+                    st.error("Uploaded file is not valid JSON.")
+                    raw_import = None
+                if raw_import is not None:
+                    raw_roster_state = raw_import
+                    if isinstance(raw_import, dict) and isinstance(raw_import.get("teams"), dict):
+                        team_map = {
+                            str(name): payload
+                            for name, payload in raw_import.get("teams", {}).items()
+                            if str(name).strip()
+                        }
+                        if not team_map:
+                            st.error("Uploaded file has no roster entries.")
+                            raw_roster_state = None
+                        else:
+                            compat_team_name = sorted(team_map.keys())[0]
+                            raw_roster_state = team_map[compat_team_name]
+                    if raw_roster_state is not None:
+                        loaded_state, dropped = _deserialize_roster_state(
+                            raw_roster_state,
+                            hitter_pool,
+                            pitcher_pool,
+                        )
+                        st.session_state[state_key] = loaded_state
+                        state = st.session_state[state_key]
+                        loaded_file_name = str(uploaded_roster_file.name or "").strip()
+                        if loaded_file_name:
+                            st.session_state[loaded_file_name_key] = loaded_file_name
+                        st.session_state[widget_sync_pending_key] = True
+                        notices = ["Roster loaded from uploaded JSON."]
+                        if compat_team_name is not None:
+                            notices.append(
+                                "Uploaded file used legacy multi-team format; "
+                                f"loaded first team `{compat_team_name}`."
+                            )
+                        if dropped > 0:
+                            notices.append(
+                                f"Dropped {int(dropped)} invalid/duplicate player selections."
+                            )
+                        st.session_state[load_notice_key] = " ".join(notices)
+                        st.rerun()
     with action_cols[1]:
-        if st.button("Load team", key=f"{key_prefix}_load_btn"):
-            if selected_save_name == "(None)":
-                st.warning("Select a saved team to load.")
-            else:
-                saved_payload = _load_roster_manager_saves(ROSTER_MANAGER_SAVE_PATH)
-                raw_saved = (saved_payload.get("teams") or {}).get(selected_save_name)
-                if raw_saved is None:
-                    st.warning("Saved team not found.")
-                else:
-                    loaded_state, dropped = _deserialize_roster_state(
-                        raw_saved,
-                        hitter_pool,
-                        pitcher_pool,
-                    )
-                    st.session_state[state_key] = loaded_state
-                    _roster_reset_ui_widget_state(key_prefix)
-                    if dropped > 0:
-                        st.warning(f"Loaded with {int(dropped)} dropped invalid/duplicate player selections.")
-                    st.rerun()
+        st.caption("Use the save button at the bottom to export current selections.")
     with action_cols[2]:
-        if st.button("Delete team", key=f"{key_prefix}_delete_btn"):
-            if selected_save_name == "(None)":
-                st.warning("Select a saved team to delete.")
-            else:
-                out_payload = _load_roster_manager_saves(ROSTER_MANAGER_SAVE_PATH)
-                teams = out_payload.get("teams", {})
-                if isinstance(teams, dict) and selected_save_name in teams:
-                    teams.pop(selected_save_name, None)
-                    out_payload["teams"] = teams
-                    out_payload["updated_at"] = _roster_now_iso()
-                    if _write_roster_manager_saves(ROSTER_MANAGER_SAVE_PATH, out_payload):
-                        st.success(f"Deleted roster `{selected_save_name}`.")
-                    else:
-                        st.error("Failed to update roster save file.")
-    with action_cols[3]:
         if st.button("Clear roster", key=f"{key_prefix}_clear_btn"):
             st.session_state[state_key] = _roster_default_state()
+            state = st.session_state[state_key]
             _roster_reset_ui_widget_state(key_prefix)
-            st.rerun()
+            st.success("Roster cleared.")
 
-    backup_cols = st.columns([1, 1, 2])
-    with backup_cols[0]:
-        export_payload = _roster_normalize_saves_payload(saves_payload)
-        st.download_button(
-            "Download saves JSON",
-            data=json.dumps(export_payload, ensure_ascii=True, indent=2, sort_keys=True),
-            file_name="roster_manager_saved_teams.json",
-            mime="application/json",
-            key=f"{key_prefix}_download_saves_json",
+    with st.expander("External JSON save/load notes", expanded=False):
+        st.caption(
+            "This workflow no longer uses in-session/local app saves. "
+            "Use `Save current roster JSON` to download and `Load roster JSON` to restore."
         )
-    with backup_cols[1]:
-        uploaded_saves_file = st.file_uploader(
-            "Import saves JSON",
-            type=["json"],
-            key=f"{key_prefix}_upload_saves_json",
-            label_visibility="collapsed",
-        )
-    with backup_cols[2]:
-        import_mode = st.radio(
-            "Import mode",
-            options=["Merge", "Replace"],
-            index=0,
-            horizontal=True,
-            key=f"{key_prefix}_import_mode",
-            help="Merge keeps existing saves and adds/replaces matching team names. Replace overwrites all saves.",
-        )
-        if st.button("Import uploaded JSON", key=f"{key_prefix}_import_saves_btn"):
-            if uploaded_saves_file is None:
-                st.warning("Upload a JSON file first.")
-            else:
-                try:
-                    raw_import = json.loads(uploaded_saves_file.getvalue().decode("utf-8"))
-                    imported_payload = _roster_normalize_saves_payload(raw_import)
-                except Exception:
-                    st.error("Uploaded file is not a valid roster saves JSON.")
-                    imported_payload = None
-                if imported_payload is not None:
-                    if import_mode == "Replace":
-                        out_payload = imported_payload
-                    else:
-                        out_payload = _load_roster_manager_saves(ROSTER_MANAGER_SAVE_PATH)
-                        merged = dict(out_payload.get("teams", {}))
-                        merged.update(dict(imported_payload.get("teams", {})))
-                        out_payload["teams"] = merged
-                    out_payload["updated_at"] = _roster_now_iso()
-                    if _write_roster_manager_saves(ROSTER_MANAGER_SAVE_PATH, out_payload):
-                        st.success(
-                            f"Imported {len((imported_payload.get('teams') or {}))} teams "
-                            f"({import_mode.lower()} mode)."
-                        )
-                        st.rerun()
-                    else:
-                        st.error("Failed to write imported saves to disk.")
 
     def _starter_candidate_ids(slot: str, *, hitter: bool, current_id: int | None) -> list[int]:
         blocked = _roster_selected_player_ids(state)
@@ -7783,6 +7821,20 @@ def show_roster_manager(
     )
     if total_selected < 50:
         st.warning("Current roster has fewer than 50 players. This is informational only.")
+
+    st.markdown("### Save Roster")
+    st.download_button(
+        "Save current roster JSON",
+        data=json.dumps(
+            _serialize_roster_state(state),
+            ensure_ascii=True,
+            indent=2,
+            sort_keys=True,
+        ),
+        file_name=save_file_name,
+        mime="application/json",
+        key=f"{key_prefix}_download_roster_json",
+    )
 
     st.session_state[state_key] = state
 
