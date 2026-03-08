@@ -865,6 +865,171 @@ def _apply_pitcher_role_overrides_edit_mode(
     return out, {"overrides_active": len(overrides), "rows_overridden": int(override_mask.sum())}
 
 
+def _apply_hitter_role_overrides_edit_mode(
+    df: pd.DataFrame,
+    *,
+    key_prefix: str,
+) -> tuple[pd.DataFrame, dict[str, int]]:
+    out = df.copy()
+    if out.empty:
+        return out, {"overrides_active": 0, "rows_overridden": 0}
+    id_col = (
+        "hitter_mlbid"
+        if "hitter_mlbid" in out.columns
+        else ("batter_mlbid" if "batter_mlbid" in out.columns else ("mlbid" if "mlbid" in out.columns else None))
+    )
+    if id_col is None:
+        st.info("Edit mode unavailable: missing hitter id column.")
+        return out, {"overrides_active": 0, "rows_overridden": 0}
+    if "opening_day_status_40man" not in out.columns:
+        out = out.assign(opening_day_status_40man="")
+
+    editor_key = f"{key_prefix}_hitter_role_overrides"
+    existing = st.session_state.get(editor_key, {})
+    if not isinstance(existing, dict):
+        existing = {}
+    overrides: dict[str, str] = {
+        str(k): str(v).strip()
+        for k, v in existing.items()
+        if str(k).strip() and str(v).strip()
+    }
+
+    name_col = (
+        "hitter_name"
+        if "hitter_name" in out.columns
+        else ("player_name" if "player_name" in out.columns else ("name" if "name" in out.columns else None))
+    )
+    team_col = _team_col(out)
+
+    candidates = out.copy()
+    candidates["id_int"] = pd.to_numeric(candidates[id_col], errors="coerce").astype("Int64")
+    candidates = candidates[candidates["id_int"].notna()].copy()
+    if candidates.empty:
+        st.info("Edit mode unavailable: no hitters with valid ids.")
+        return out, {"overrides_active": len(overrides), "rows_overridden": 0}
+
+    keep_cols = ["id_int", "opening_day_status_40man"]
+    if name_col:
+        keep_cols.append(name_col)
+    if team_col:
+        keep_cols.append(team_col)
+    candidates = candidates[keep_cols].drop_duplicates(subset=["id_int"], keep="first").copy()
+
+    role_values_df = (
+        out["opening_day_status_40man"].dropna().astype(str).str.strip().tolist()
+        if "opening_day_status_40man" in out.columns
+        else []
+    )
+    lookup = _load_40man_lookup(for_pitchers=False)
+    role_values_lookup = (
+        lookup["opening_day_status_40man"].dropna().astype(str).str.strip().tolist()
+        if not lookup.empty and "opening_day_status_40man" in lookup.columns
+        else []
+    )
+    role_options = sorted(
+        {
+            v
+            for v in (role_values_df + role_values_lookup)
+            if v and v.lower() != "nan"
+        }
+    )
+    if not role_options:
+        role_options = [
+            "Lineup Regular",
+            "Platoon vs L",
+            "Platoon vs R",
+            "Bench",
+            "Lineup/Bench Candidate",
+            "Projected Injured List",
+            "Bench Candidate",
+            "Lineup Candidate",
+            "Optioned",
+            "Projected Injured List (MiLB)",
+            "DFA",
+            "Reassigned",
+            "60-Day IL",
+        ]
+
+    label_by_key: dict[str, str] = {}
+    current_role_by_key: dict[str, str] = {}
+    for row in candidates.itertuples(index=False):
+        pid = getattr(row, "id_int")
+        if pd.isna(pid):
+            continue
+        key = str(int(pid))
+        nm = str(getattr(row, name_col) if name_col else f"Hitter {key}").strip() if name_col else f"Hitter {key}"
+        tm = str(getattr(row, team_col) if team_col else "").strip().upper() if team_col else ""
+        cur_role = str(getattr(row, "opening_day_status_40man", "") or "").strip()
+        current_role_by_key[key] = cur_role
+        if tm:
+            label_by_key[key] = f"{nm} ({tm}) [{key}]"
+        else:
+            label_by_key[key] = f"{nm} [{key}]"
+
+    picker_keys = sorted(label_by_key.keys(), key=lambda k: label_by_key[k])
+    if not picker_keys:
+        return out, {"overrides_active": len(overrides), "rows_overridden": 0}
+    picker_labels = [label_by_key[k] for k in picker_keys]
+    selected_label = st.selectbox(
+        "Edit mode: hitter",
+        picker_labels,
+        index=0,
+        key=f"{key_prefix}_edit_mode_hitter_picker",
+    )
+    selected_key = picker_keys[picker_labels.index(selected_label)]
+
+    role_placeholder = "(Clear role)"
+    current_effective = overrides.get(selected_key, current_role_by_key.get(selected_key, ""))
+    role_index = 0
+    if current_effective in role_options:
+        role_index = 1 + role_options.index(current_effective)
+    selected_role = st.selectbox(
+        "Edit mode: override Opening Day role",
+        [role_placeholder] + role_options,
+        index=role_index,
+        key=f"{key_prefix}_edit_mode_hitter_role_value",
+        help="Overrides role for this hitter in the current app session.",
+    )
+    edit_cols = st.columns(3)
+    with edit_cols[0]:
+        if st.button("Apply override", key=f"{key_prefix}_edit_mode_apply_hitter_role"):
+            if selected_role == role_placeholder:
+                overrides.pop(selected_key, None)
+            else:
+                overrides[selected_key] = selected_role
+            st.session_state[editor_key] = overrides
+            st.rerun()
+    with edit_cols[1]:
+        if st.button("Clear selected", key=f"{key_prefix}_edit_mode_clear_hitter_selected"):
+            overrides.pop(selected_key, None)
+            st.session_state[editor_key] = overrides
+            st.rerun()
+    with edit_cols[2]:
+        if st.button("Clear all overrides", key=f"{key_prefix}_edit_mode_clear_hitter_all"):
+            st.session_state[editor_key] = {}
+            st.rerun()
+
+    if overrides:
+        rows = []
+        for key, role in sorted(overrides.items(), key=lambda kv: label_by_key.get(kv[0], kv[0])):
+            rows.append(
+                {
+                    "Hitter": label_by_key.get(key, key),
+                    "Override Opening Day Role": role,
+                    "Roster Role": current_role_by_key.get(key, ""),
+                }
+            )
+        st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
+    id_keys = pd.to_numeric(out[id_col], errors="coerce").astype("Int64").astype("string")
+    mapped_roles = id_keys.map(overrides)
+    override_mask = mapped_roles.notna()
+    if bool(override_mask.any()):
+        out.loc[override_mask, "opening_day_status_40man"] = mapped_roles.loc[override_mask].astype(str)
+
+    return out, {"overrides_active": len(overrides), "rows_overridden": int(override_mask.sum())}
+
+
 def _recompute_projection_spreads(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     spread_cols = [c for c in out.columns if c.endswith("_proj_spread")]
@@ -3408,6 +3573,98 @@ def _add_derived_points_metrics(df: pd.DataFrame) -> pd.DataFrame:
             - pd.to_numeric(out["SGP_pitch_proj_p25"], errors="coerce")
         )
     return out
+
+
+def _apply_fixed_volume_projection_view(
+    df: pd.DataFrame,
+    *,
+    target_pa: float | None = None,
+    target_ip: float | None = None,
+) -> pd.DataFrame:
+    out = df.copy()
+
+    def _num(col: str) -> pd.Series:
+        if col not in out.columns:
+            return pd.Series(np.nan, index=out.index, dtype="float64")
+        return pd.to_numeric(out[col], errors="coerce")
+
+    pct_tags = ("p20", "p25", "p50", "p75", "p80", "p600")
+
+    if (target_pa is not None) and (target_pa > 0.0):
+        hitter_bases = [
+            "PA",
+            "AB",
+            "H",
+            "1B",
+            "2B",
+            "3B",
+            "HR",
+            "Runs",
+            "RBI",
+            "SB",
+            "CS",
+            "SBA",
+            "BB",
+            "SO",
+            "HBP",
+            "SF",
+            "SH",
+            "bbe",
+            "BIP",
+            "Points",
+            "SGP",
+        ]
+        for tag in pct_tags:
+            pa_col = f"PA_proj_{tag}"
+            if pa_col not in out.columns:
+                continue
+            pa_vals = _num(pa_col)
+            pa_den = pa_vals.where(pa_vals.abs() > 1e-12, np.nan)
+            tag_scale = float(target_pa) / pa_den
+            for base in hitter_bases:
+                src_col = f"{base}_proj_{tag}"
+                if src_col in out.columns:
+                    out[src_col] = _num(src_col) * tag_scale
+
+    if (target_ip is not None) and (target_ip > 0.0):
+        pitcher_bases = [
+            "IP",
+            "IP_marcel",
+            "TBF",
+            "TBF_marcel",
+            "G",
+            "G_marcel",
+            "GS",
+            "GS_marcel",
+            "W",
+            "SV",
+            "SO",
+            "K",
+            "BB",
+            "H",
+            "HR",
+            "HBP",
+            "ER",
+            "Points",
+            "SGP",
+        ]
+        for tag in pct_tags:
+            ip_col = (
+                f"IP_proj_{tag}"
+                if f"IP_proj_{tag}" in out.columns
+                else (f"IP_marcel_proj_{tag}" if f"IP_marcel_proj_{tag}" in out.columns else "")
+            )
+            if not ip_col:
+                continue
+            ip_vals = _num(ip_col)
+            ip_den = ip_vals.where(ip_vals.abs() > 1e-12, np.nan)
+            tag_scale = float(target_ip) / ip_den
+            for base in pitcher_bases:
+                src_col = f"{base}_proj_{tag}"
+                if src_col in out.columns:
+                    out[src_col] = _num(src_col) * tag_scale
+
+    return _recompute_projection_spreads(out)
 
 
 def _metric_base_from_proj_col(col: str) -> str:
@@ -7869,7 +8126,7 @@ def _run_projection_sandbox() -> None:
     )
     _apply_compact_ui_chrome(compact_ui)
 
-    hitter_source_options = {
+    hitter_source_base_options = {
         "Traditional Two-Stage (KPI Adjusted, p50)": Path(
             "projection_outputs/sandbox/traditional_two_stage_projections_2026.parquet"
         ),
@@ -7877,7 +8134,7 @@ def _run_projection_sandbox() -> None:
             "projection_outputs/sandbox/kpi_projections_2026.parquet"
         ),
     }
-    pitcher_source_options = {
+    pitcher_source_base_options = {
         "Two Stage KPI Projections, Pitchers": Path(
             "projection_outputs/sandbox/two_stage_kpi_pitcher_projections_2026.parquet"
         ),
@@ -7891,6 +8148,27 @@ def _run_projection_sandbox() -> None:
             "projection_outputs/sandbox/pitcher_kpi_projections_2026_recency_3_1_1.parquet"
         ),
     }
+    fixed_view_label = "Per 600 PA / Per 180 IP Projections"
+    hitter_source_options: dict[str, dict[str, object]] = {
+        **{
+            label: {"path": path, "fixed_volume": "standard"}
+            for label, path in hitter_source_base_options.items()
+        },
+        fixed_view_label: {
+            "path": Path("projection_outputs/sandbox/traditional_two_stage_projections_2026.parquet"),
+            "fixed_volume": "per600pa",
+        },
+    }
+    pitcher_source_options: dict[str, dict[str, object]] = {
+        **{
+            label: {"path": path, "fixed_volume": "standard"}
+            for label, path in pitcher_source_base_options.items()
+        },
+        fixed_view_label: {
+            "path": Path("projection_outputs/sandbox/two_stage_kpi_pitcher_projections_2026.parquet"),
+            "fixed_volume": "per180ip",
+        },
+    }
     hitter_source_state_key = "projection_sandbox_hitter_source"
     pitcher_source_state_key = "projection_sandbox_pitcher_source"
     hitter_source_labels = list(hitter_source_options.keys())
@@ -7903,8 +8181,12 @@ def _run_projection_sandbox() -> None:
 
     selected_hitter_source = str(st.session_state[hitter_source_state_key])
     selected_pitcher_source = str(st.session_state[pitcher_source_state_key])
-    hitters_path = hitter_source_options[selected_hitter_source]
-    pitchers_path = pitcher_source_options[selected_pitcher_source]
+    selected_hitter_cfg = hitter_source_options[selected_hitter_source]
+    selected_pitcher_cfg = pitcher_source_options[selected_pitcher_source]
+    hitters_path = Path(str(selected_hitter_cfg.get("path")))
+    pitchers_path = Path(str(selected_pitcher_cfg.get("path")))
+    hitter_fixed_volume_mode = str(selected_hitter_cfg.get("fixed_volume") or "standard")
+    pitcher_fixed_volume_mode = str(selected_pitcher_cfg.get("fixed_volume") or "standard")
     backtest = pd.DataFrame()
 
     def _source_slug(*parts: str) -> str:
@@ -7935,7 +8217,10 @@ def _run_projection_sandbox() -> None:
     pitchers = _attach_40man_context(pitchers, for_pitchers=True)
     pitchers = _attach_adp_context(pitchers, for_pitchers=True)
 
-    show_before_after = selected_hitter_source == "Traditional Two-Stage (KPI Adjusted, p50)"
+    show_before_after = (
+        hitters_path
+        == Path("projection_outputs/sandbox/traditional_two_stage_projections_2026.parquet")
+    ) and (hitter_fixed_volume_mode == "standard")
     base_traditional = (
         load_projection(Path("projection_outputs/sandbox/traditional_projections_2026.parquet"))
         if show_before_after
@@ -7950,10 +8235,32 @@ def _run_projection_sandbox() -> None:
 
     st.caption(
         "Auto-loaded projection sources: "
-        f"Hitters=`{hitters_path}` | Pitchers=`{pitchers_path}`"
+        f"Hitters=`{hitters_path}` ({hitter_fixed_volume_mode}) | "
+        f"Pitchers=`{pitchers_path}` ({pitcher_fixed_volume_mode})"
     )
 
-    enable_role_edit_mode = st.checkbox(
+    enable_hitter_role_edit_mode = st.checkbox(
+        "Enable edit mode (hitter Opening Day role overrides)",
+        value=False,
+        key=f"{source_combo_key}_enable_hitter_role_edit_mode",
+        help=(
+            "Lets you override Opening Day role for individual hitters in this session. "
+            "Overrides feed into role-based PA blending and hitter role-priority allocators."
+        ),
+    )
+    if bool(enable_hitter_role_edit_mode):
+        with st.expander("Edit mode: hitter Opening Day roles", expanded=False):
+            hitters, hitter_edit_summary = _apply_hitter_role_overrides_edit_mode(
+                hitters,
+                key_prefix=source_combo_key,
+            )
+        st.caption(
+            "Hitter edit mode overrides: "
+            f"active={hitter_edit_summary.get('overrides_active', 0)}, "
+            f"rows impacted={hitter_edit_summary.get('rows_overridden', 0)}"
+        )
+
+    enable_pitcher_role_edit_mode = st.checkbox(
         "Enable edit mode (pitcher Opening Day role overrides)",
         value=False,
         key=f"{source_combo_key}_enable_pitcher_role_edit_mode",
@@ -7962,7 +8269,7 @@ def _run_projection_sandbox() -> None:
             "Overrides feed into role-based IP blending and saves redistribution."
         ),
     )
-    if bool(enable_role_edit_mode):
+    if bool(enable_pitcher_role_edit_mode):
         with st.expander("Edit mode: pitcher Opening Day roles", expanded=False):
             pitchers, edit_summary = _apply_pitcher_role_overrides_edit_mode(
                 pitchers,
@@ -8105,14 +8412,27 @@ def _run_projection_sandbox() -> None:
             f"SB p50 total={sb_txt}, SBA p50 total={sba_txt}"
         )
 
+    if hitter_fixed_volume_mode.startswith("per600pa"):
+        hitters = _apply_fixed_volume_projection_view(
+            hitters,
+            target_pa=600.0,
+        )
+        st.caption("Hitter source mode: fixed 600 PA across projection percentiles.")
+    if pitcher_fixed_volume_mode.startswith("per180ip"):
+        pitchers = _apply_fixed_volume_projection_view(
+            pitchers,
+            target_ip=180.0,
+        )
+        st.caption("Pitcher source mode: fixed 180 IP across projection percentiles.")
+
     hide_cols_hitters: set[str] = set()
-    if selected_hitter_source == "Traditional Two-Stage (KPI Adjusted, p50)":
+    if hitters_path == Path("projection_outputs/sandbox/traditional_two_stage_projections_2026.parquet"):
         hide_cols_hitters = {"age_source", "source_season"}
     hide_cols_pitchers: set[str] = set()
-    prefer_kpi_hitters = selected_hitter_source == "KPI Projections (Individual Stat Skills)"
-    prefer_kpi_pitchers = selected_pitcher_source in {
-        "KPI Projections (Individual Stat Skills)",
-        "KPI Projections (Individual Stat Skills, Pitchers 3/1/1 Recency)",
+    prefer_kpi_hitters = hitters_path == Path("projection_outputs/sandbox/kpi_projections_2026.parquet")
+    prefer_kpi_pitchers = pitchers_path in {
+        Path("projection_outputs/sandbox/pitcher_kpi_projections_2026.parquet"),
+        Path("projection_outputs/sandbox/pitcher_kpi_projections_2026_recency_3_1_1.parquet"),
     }
 
     tab_labels = ["Hitters", "Pitchers", "All Players", "Backtest"]
@@ -8126,7 +8446,7 @@ def _run_projection_sandbox() -> None:
             "Hitters projection source",
             hitter_source_labels,
             key=hitter_source_state_key,
-            help="Default auto-load is hitter two-stage. Switch to KPI hitters if needed.",
+            help="Choose base source or the fixed-volume projections view.",
         )
         show_table(
             hitters,
@@ -8143,7 +8463,7 @@ def _run_projection_sandbox() -> None:
             "Pitchers projection source",
             pitcher_source_labels,
             key=pitcher_source_state_key,
-            help="Default auto-load is pitcher two-stage. Switch to KPI pitchers if needed.",
+            help="Choose base source or the fixed-volume projections view.",
         )
         show_table(
             pitchers,
