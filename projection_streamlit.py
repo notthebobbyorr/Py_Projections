@@ -402,8 +402,10 @@ ROSTER_MANAGER_SAVE_PATH = (
     / "sandbox"
     / "roster_manager_saved_teams.json"
 )
-ROSTER_MANAGER_SCHEMA_VERSION = 1
+ROSTER_MANAGER_SCHEMA_VERSION = 2
 ROSTER_PERCENTILE_OPTIONS = ("p25", "p50", "p75")
+ROSTER_PLACEHOLDER_HITTER_POSITIONS = ("C", "1B", "2B", "3B", "SS", "OF")
+ROSTER_PLACEHOLDER_PITCHER_ROLES = ("SP", "RP")
 ROSTER_HITTER_STARTER_SLOTS = [
     "C1",
     "C2",
@@ -4018,6 +4020,30 @@ def _roster_parse_nonneg_float(value: object) -> float | None:
     return out
 
 
+def _roster_default_manual_projection_counts(*, hitter: bool) -> dict[str, float]:
+    keys = (
+        ROSTER_HITTER_MANUAL_COUNT_STATS
+        if hitter
+        else ROSTER_PITCHER_MANUAL_COUNT_STATS
+    )
+    return {key: 0.0 for key in keys}
+
+
+def _roster_normalize_placeholder_manual_stats(
+    value: object,
+    *,
+    hitter: bool,
+) -> dict[str, float]:
+    out = _roster_default_manual_projection_counts(hitter=hitter)
+    if not isinstance(value, dict):
+        return out
+    for key in out:
+        parsed = _roster_parse_nonneg_float(value.get(key))
+        if parsed is not None:
+            out[key] = float(parsed)
+    return out
+
+
 def _roster_normalize_manual_stats(
     value: object,
     *,
@@ -4042,6 +4068,167 @@ def _roster_normalize_manual_stats(
     if not any_value:
         return None
     return out
+
+
+def _roster_tokens_from_input(value: object) -> tuple[str, ...]:
+    if isinstance(value, (list, tuple, set)):
+        raw = ",".join(str(item) for item in value)
+    else:
+        raw = str(value or "")
+    return _position_tokens_from_text(raw)
+
+
+def _roster_normalize_custom_player_entry(
+    value: object,
+    *,
+    hitter: bool,
+) -> dict[str, object] | None:
+    if not isinstance(value, dict):
+        return None
+    player_id = _roster_parse_int(value.get("player_id"))
+    if player_id is None or player_id >= 0:
+        return None
+
+    fallback_name = f"Placeholder {'Hitter' if hitter else 'Pitcher'} {abs(int(player_id))}"
+    name = str(value.get("name") or "").strip() or fallback_name
+    team_raw = str(value.get("team") or "").strip()
+    team = str(_normalize_team_token(team_raw) or team_raw or "FA").upper().strip() or "FA"
+
+    if hitter:
+        positions = tuple(
+            sorted(
+                {
+                    tok
+                    for tok in _roster_tokens_from_input(value.get("positions"))
+                    if tok in set(ROSTER_PLACEHOLDER_HITTER_POSITIONS)
+                }
+            )
+        )
+        manual_stats = _roster_normalize_placeholder_manual_stats(
+            value.get("manual_stats"),
+            hitter=True,
+        )
+        plate_appearances = _roster_parse_nonneg_float(value.get("plate_appearances"))
+        if plate_appearances is None:
+            plate_appearances = float(manual_stats.get("AB", 0.0))
+        return {
+            "player_id": int(player_id),
+            "name": name,
+            "team": team,
+            "positions": list(positions),
+            "plate_appearances": float(plate_appearances),
+            "manual_stats": manual_stats,
+        }
+
+    roles = tuple(
+        sorted(
+            {
+                tok
+                for tok in _roster_tokens_from_input(value.get("roles"))
+                if tok in set(ROSTER_PLACEHOLDER_PITCHER_ROLES)
+            }
+        )
+    )
+    if not roles:
+        roles = ("SP",)
+    return {
+        "player_id": int(player_id),
+        "name": name,
+        "team": team,
+        "roles": list(roles),
+        "manual_stats": _roster_normalize_placeholder_manual_stats(
+            value.get("manual_stats"),
+            hitter=False,
+        ),
+    }
+
+
+def _roster_normalize_custom_player_lists(
+    raw_hitters: object,
+    raw_pitchers: object,
+    *,
+    next_player_id_raw: object = None,
+) -> tuple[list[dict[str, object]], list[dict[str, object]], int]:
+    used_ids: set[int] = set()
+
+    def _clean(values: object, *, hitter: bool) -> list[dict[str, object]]:
+        out: list[dict[str, object]] = []
+        if not isinstance(values, list):
+            return out
+        for item in values:
+            normalized = _roster_normalize_custom_player_entry(item, hitter=hitter)
+            if normalized is None:
+                continue
+            player_id = int(normalized["player_id"])
+            if player_id in used_ids:
+                continue
+            out.append(normalized)
+            used_ids.add(player_id)
+        return out
+
+    custom_hitters = _clean(raw_hitters, hitter=True)
+    custom_pitchers = _clean(raw_pitchers, hitter=False)
+    min_existing_id = min([0, *used_ids]) if used_ids else 0
+    next_player_id = _roster_parse_int(next_player_id_raw)
+    if next_player_id is None or next_player_id >= 0 or next_player_id >= min_existing_id:
+        next_player_id = int(min_existing_id - 1)
+    return custom_hitters, custom_pitchers, int(next_player_id)
+
+
+def _roster_normalize_custom_players_in_state(state: dict) -> None:
+    custom_hitters, custom_pitchers, next_player_id = _roster_normalize_custom_player_lists(
+        state.get("custom_hitters"),
+        state.get("custom_pitchers"),
+        next_player_id_raw=state.get("next_custom_player_id"),
+    )
+    state["custom_hitters"] = custom_hitters
+    state["custom_pitchers"] = custom_pitchers
+    state["next_custom_player_id"] = int(next_player_id)
+
+
+def _roster_add_custom_player(state: dict, *, hitter: bool) -> int:
+    _roster_normalize_custom_players_in_state(state)
+    next_player_id = _roster_parse_int(state.get("next_custom_player_id"))
+    if next_player_id is None or next_player_id >= 0:
+        next_player_id = -1
+    entry: dict[str, object] = {
+        "player_id": int(next_player_id),
+        "name": "",
+        "team": "FA",
+        "manual_stats": _roster_default_manual_projection_counts(hitter=hitter),
+    }
+    if hitter:
+        entry["positions"] = []
+        entry["plate_appearances"] = 0.0
+        state.setdefault("custom_hitters", []).append(entry)
+    else:
+        entry["roles"] = ["SP"]
+        state.setdefault("custom_pitchers", []).append(entry)
+    state["next_custom_player_id"] = int(next_player_id - 1)
+    return int(next_player_id)
+
+
+def _roster_clear_player_from_state(state: dict, player_id: int) -> None:
+    for slot in ROSTER_ALL_STARTER_SLOTS:
+        if _roster_parse_int(state.get("starters", {}).get(slot)) != int(player_id):
+            continue
+        state["starters"][slot] = None
+        if isinstance(state.get("starter_custom_volume"), dict):
+            state["starter_custom_volume"][slot] = None
+        if isinstance(state.get("starter_manual_stats"), dict):
+            state["starter_manual_stats"][slot] = None
+    for reserve_key in ("hitter_reserves", "pitcher_reserves"):
+        reserves = state.get(reserve_key, [])
+        if not isinstance(reserves, list):
+            continue
+        for row in reserves:
+            if not isinstance(row, dict):
+                continue
+            if _roster_parse_int(row.get("player_id")) != int(player_id):
+                continue
+            row["player_id"] = None
+            row["custom_volume"] = None
+            row["manual_stats"] = None
 
 
 def _roster_hitter_stats_from_manual(
@@ -4095,6 +4282,9 @@ def _roster_default_state() -> dict:
         "starter_manual_stats": {slot: None for slot in ROSTER_ALL_STARTER_SLOTS},
         "hitter_reserves": [],
         "pitcher_reserves": [],
+        "custom_hitters": [],
+        "custom_pitchers": [],
+        "next_custom_player_id": -1,
         "next_row_id": 1,
     }
 
@@ -4254,6 +4444,130 @@ def _build_roster_player_pool(df: pd.DataFrame, *, for_pitchers: bool) -> pd.Dat
     return work
 
 
+def _build_roster_custom_player_pool(
+    custom_players: object,
+    *,
+    for_pitchers: bool,
+) -> pd.DataFrame:
+    if not isinstance(custom_players, list) or not custom_players:
+        return pd.DataFrame(columns=["mlbid", "name", "team", "label", "elig_tokens"])
+
+    rows: list[dict[str, object]] = []
+    for item in custom_players:
+        normalized = _roster_normalize_custom_player_entry(item, hitter=(not for_pitchers))
+        if normalized is None:
+            continue
+        player_id = int(normalized["player_id"])
+        name = str(normalized.get("name") or "").strip() or (
+            f"Placeholder {'Pitcher' if for_pitchers else 'Hitter'} {abs(player_id)}"
+        )
+        team = str(normalized.get("team") or "FA").upper().strip() or "FA"
+
+        if for_pitchers:
+            roles = tuple(
+                tok
+                for tok in normalized.get("roles", [])
+                if tok in set(ROSTER_PLACEHOLDER_PITCHER_ROLES)
+            )
+            if not roles:
+                roles = ("SP",)
+            manual_stats = _roster_normalize_placeholder_manual_stats(
+                normalized.get("manual_stats"),
+                hitter=False,
+            )
+            ip = float(manual_stats.get("IP", 0.0))
+            h = float(manual_stats.get("H", 0.0))
+            bb = float(manual_stats.get("BB", 0.0))
+            er = float(manual_stats.get("ER", 0.0))
+            whip = ((h + bb) / ip) if ip > 0.0 else float("nan")
+            era = ((9.0 * er) / ip) if ip > 0.0 else float("nan")
+            row: dict[str, object] = {
+                "mlbid": player_id,
+                "name": name,
+                "team": team,
+                "label": f"{name} - {team} - {'/'.join(roles)} [manual]",
+                "elig_tokens": tuple(sorted(set(roles))),
+                "position": "/".join(roles),
+                "is_placeholder": True,
+            }
+            for pct in ROSTER_PERCENTILE_OPTIONS:
+                row[f"W_proj_{pct}"] = float(manual_stats.get("W", 0.0))
+                row[f"SO_proj_{pct}"] = float(manual_stats.get("K", 0.0))
+                row[f"SV_proj_{pct}"] = float(manual_stats.get("SV", 0.0))
+                row[f"WHIP_proj_{pct}"] = whip
+                row[f"ERA_proj_{pct}"] = era
+                row[f"IP_proj_{pct}"] = ip
+                row[f"H_proj_{pct}"] = h
+                row[f"BB_proj_{pct}"] = bb
+            rows.append(row)
+            continue
+
+        positions = tuple(
+            tok
+            for tok in normalized.get("positions", [])
+            if tok in set(ROSTER_PLACEHOLDER_HITTER_POSITIONS)
+        )
+        manual_stats = _roster_normalize_placeholder_manual_stats(
+            normalized.get("manual_stats"),
+            hitter=True,
+        )
+        ab = float(manual_stats.get("AB", 0.0))
+        h = float(manual_stats.get("H", 0.0))
+        avg = (h / ab) if ab > 0.0 else float("nan")
+        pa = _roster_parse_nonneg_float(normalized.get("plate_appearances"))
+        if pa is None:
+            pa = ab
+        elig_tokens = tuple(sorted({*positions, "UT"}))
+        display_positions = positions or ("UT",)
+        row = {
+            "mlbid": player_id,
+            "name": name,
+            "team": team,
+            "label": f"{name} - {team} - {'/'.join(display_positions)} [manual]",
+            "elig_tokens": elig_tokens,
+            "position": "/".join(display_positions),
+            "is_placeholder": True,
+        }
+        for pct in ROSTER_PERCENTILE_OPTIONS:
+            row[f"PA_proj_{pct}"] = float(pa)
+            row[f"HR_proj_{pct}"] = float(manual_stats.get("HR", 0.0))
+            row[f"Runs_proj_{pct}"] = float(manual_stats.get("R", 0.0))
+            row[f"RBI_proj_{pct}"] = float(manual_stats.get("RBI", 0.0))
+            row[f"SB_proj_{pct}"] = float(manual_stats.get("SB", 0.0))
+            row[f"AVG_proj_{pct}"] = avg
+            row[f"AB_proj_{pct}"] = ab
+            row[f"H_proj_{pct}"] = h
+        rows.append(row)
+
+    if not rows:
+        return pd.DataFrame(columns=["mlbid", "name", "team", "label", "elig_tokens"])
+    return pd.DataFrame(rows)
+
+
+def _combine_roster_player_pools(
+    base_pool: pd.DataFrame,
+    custom_players: object,
+    *,
+    for_pitchers: bool,
+) -> pd.DataFrame:
+    custom_pool = _build_roster_custom_player_pool(custom_players, for_pitchers=for_pitchers)
+    if base_pool.empty:
+        out = custom_pool.copy()
+    elif custom_pool.empty:
+        out = base_pool.copy()
+    else:
+        out = pd.concat([base_pool, custom_pool], ignore_index=True, sort=False)
+    if out.empty:
+        return out
+    out["mlbid"] = pd.to_numeric(out.get("mlbid"), errors="coerce").astype("Int64")
+    out = out[out["mlbid"].notna()].copy()
+    out["mlbid"] = out["mlbid"].astype("int64")
+    out = out.sort_values(["mlbid", "label"]).drop_duplicates(subset=["mlbid"], keep="last").copy()
+    if "label" in out.columns:
+        out = out.sort_values("label").reset_index(drop=True)
+    return out
+
+
 def _roster_hitter_slot_is_eligible(slot: str, tokens: tuple[str, ...]) -> bool:
     tok_set = set(tokens)
     if slot == "UT":
@@ -4334,6 +4648,11 @@ def _roster_add_reserve_row(
 
 
 def _serialize_roster_state(state: dict) -> dict:
+    custom_hitters, custom_pitchers, next_custom_player_id = _roster_normalize_custom_player_lists(
+        state.get("custom_hitters"),
+        state.get("custom_pitchers"),
+        next_player_id_raw=state.get("next_custom_player_id"),
+    )
     out_starters: dict[str, int | None] = {}
     out_starter_pct: dict[str, str] = {}
     out_starter_custom_volume: dict[str, float | None] = {}
@@ -4397,6 +4716,9 @@ def _serialize_roster_state(state: dict) -> dict:
         "starter_manual_stats": out_starter_manual_stats,
         "hitter_reserves": _serialize_reserves("hitter_reserves"),
         "pitcher_reserves": _serialize_reserves("pitcher_reserves"),
+        "custom_hitters": custom_hitters,
+        "custom_pitchers": custom_pitchers,
+        "next_custom_player_id": next_custom_player_id,
     }
 
 
@@ -4405,10 +4727,34 @@ def _deserialize_roster_state(raw_state: object, hitter_pool: pd.DataFrame, pitc
     if not isinstance(raw_state, dict):
         return state, 0
 
-    hitter_ids = set(pd.to_numeric(hitter_pool.get("mlbid"), errors="coerce").dropna().astype("int64").tolist())
-    pitcher_ids = set(pd.to_numeric(pitcher_pool.get("mlbid"), errors="coerce").dropna().astype("int64").tolist())
-    hitter_tokens = hitter_pool.set_index("mlbid")["elig_tokens"].to_dict() if not hitter_pool.empty else {}
-    pitcher_tokens = pitcher_pool.set_index("mlbid")["elig_tokens"].to_dict() if not pitcher_pool.empty else {}
+    custom_hitters, custom_pitchers, next_custom_player_id = _roster_normalize_custom_player_lists(
+        raw_state.get("custom_hitters"),
+        raw_state.get("custom_pitchers"),
+        next_player_id_raw=raw_state.get("next_custom_player_id"),
+    )
+    state["custom_hitters"] = custom_hitters
+    state["custom_pitchers"] = custom_pitchers
+    state["next_custom_player_id"] = int(next_custom_player_id)
+
+    hitter_pool_full = _combine_roster_player_pools(
+        hitter_pool,
+        custom_hitters,
+        for_pitchers=False,
+    )
+    pitcher_pool_full = _combine_roster_player_pools(
+        pitcher_pool,
+        custom_pitchers,
+        for_pitchers=True,
+    )
+
+    hitter_ids = set(
+        pd.to_numeric(hitter_pool_full.get("mlbid"), errors="coerce").dropna().astype("int64").tolist()
+    )
+    pitcher_ids = set(
+        pd.to_numeric(pitcher_pool_full.get("mlbid"), errors="coerce").dropna().astype("int64").tolist()
+    )
+    hitter_tokens = hitter_pool_full.set_index("mlbid")["elig_tokens"].to_dict() if not hitter_pool_full.empty else {}
+    pitcher_tokens = pitcher_pool_full.set_index("mlbid")["elig_tokens"].to_dict() if not pitcher_pool_full.empty else {}
 
     default_pct = _roster_norm_percentile(
         raw_state.get("default_percentile", raw_state.get("percentile", "p50"))
@@ -4518,10 +4864,159 @@ def _roster_reset_ui_widget_state(key_prefix: str) -> None:
         f"{key_prefix}_starter_",
         f"{key_prefix}_hres_",
         f"{key_prefix}_pres_",
+        f"{key_prefix}_custom_",
     )
     for key in list(st.session_state.keys()):
         if any(str(key).startswith(prefix) for prefix in reset_prefixes):
             st.session_state.pop(key, None)
+
+
+def _roster_prepare_live_state(raw_state: object) -> dict:
+    live_state = raw_state if isinstance(raw_state, dict) else _roster_default_state()
+    if not isinstance(live_state.get("starters"), dict):
+        live_state["starters"] = {slot: None for slot in ROSTER_ALL_STARTER_SLOTS}
+    for slot in ROSTER_ALL_STARTER_SLOTS:
+        if slot not in live_state["starters"]:
+            live_state["starters"][slot] = None
+    for reserve_key in ("hitter_reserves", "pitcher_reserves"):
+        if not isinstance(live_state.get(reserve_key), list):
+            live_state[reserve_key] = []
+    next_row_id = _roster_parse_int(live_state.get("next_row_id"))
+    live_state["next_row_id"] = int(next_row_id if (next_row_id is not None and next_row_id >= 1) else 1)
+    default_pct = _roster_norm_percentile(
+        live_state.get("default_percentile", live_state.get("percentile", "p50"))
+    )
+    live_state["default_percentile"] = default_pct
+    live_state["percentile"] = default_pct
+    if not isinstance(live_state.get("starter_percentiles"), dict):
+        live_state["starter_percentiles"] = {}
+    if not isinstance(live_state.get("starter_custom_volume"), dict):
+        live_state["starter_custom_volume"] = {}
+    if not isinstance(live_state.get("starter_manual_stats"), dict):
+        live_state["starter_manual_stats"] = {}
+    for slot in ROSTER_ALL_STARTER_SLOTS:
+        live_state["starter_percentiles"][slot] = _roster_norm_percentile(
+            live_state["starter_percentiles"].get(slot),
+            default=default_pct,
+        )
+        live_state["starter_custom_volume"][slot] = _roster_parse_nonneg_float(
+            live_state["starter_custom_volume"].get(slot)
+        )
+        live_state["starter_manual_stats"][slot] = _roster_normalize_manual_stats(
+            live_state["starter_manual_stats"].get(slot),
+            hitter=(slot in ROSTER_HITTER_STARTER_SLOTS),
+        )
+    _roster_normalize_custom_players_in_state(live_state)
+    return live_state
+
+
+def _roster_validate_live_state(
+    live_state: dict,
+    *,
+    hitter_pool_by_id: pd.DataFrame,
+    pitcher_pool_by_id: pd.DataFrame,
+    hitter_tokens_by_id: dict[int, tuple[str, ...]],
+    pitcher_tokens_by_id: dict[int, tuple[str, ...]],
+) -> int:
+    dropped_from_state = 0
+    used_ids: set[int] = set()
+
+    for slot in ROSTER_HITTER_STARTER_SLOTS:
+        pid = _roster_parse_int(live_state["starters"].get(slot))
+        if pid is None:
+            live_state["starters"][slot] = None
+            live_state["starter_custom_volume"][slot] = None
+            live_state["starter_manual_stats"][slot] = None
+            continue
+        if (
+            pid in hitter_pool_by_id.index
+            and pid not in used_ids
+            and _roster_hitter_slot_is_eligible(slot, tuple(hitter_tokens_by_id.get(pid, tuple())))
+        ):
+            live_state["starters"][slot] = pid
+            used_ids.add(pid)
+        else:
+            live_state["starters"][slot] = None
+            live_state["starter_custom_volume"][slot] = None
+            live_state["starter_manual_stats"][slot] = None
+            dropped_from_state += 1
+
+    for slot in ROSTER_PITCHER_STARTER_SLOTS:
+        pid = _roster_parse_int(live_state["starters"].get(slot))
+        if pid is None:
+            live_state["starters"][slot] = None
+            live_state["starter_custom_volume"][slot] = None
+            live_state["starter_manual_stats"][slot] = None
+            continue
+        if (
+            pid in pitcher_pool_by_id.index
+            and pid not in used_ids
+            and _roster_pitcher_slot_is_eligible(slot, tuple(pitcher_tokens_by_id.get(pid, tuple())))
+        ):
+            live_state["starters"][slot] = pid
+            used_ids.add(pid)
+        else:
+            live_state["starters"][slot] = None
+            live_state["starter_custom_volume"][slot] = None
+            live_state["starter_manual_stats"][slot] = None
+            dropped_from_state += 1
+
+    for reserve_key, pool_by_id, hitter_flag in (
+        ("hitter_reserves", hitter_pool_by_id, True),
+        ("pitcher_reserves", pitcher_pool_by_id, False),
+    ):
+        cleaned_rows: list[dict[str, object]] = []
+        for idx, row in enumerate(live_state.get(reserve_key, [])):
+            row_dict = row if isinstance(row, dict) else {"player_id": row}
+            row_id = str(row_dict.get("row_id") or f"{reserve_key}_{idx+1}").strip()
+            if not row_id:
+                row_id = f"{reserve_key}_{idx+1}"
+            row_pct = _roster_norm_percentile(
+                row_dict.get("percentile"),
+                default=live_state.get("default_percentile", "p50"),
+            )
+            row_custom = _roster_parse_nonneg_float(row_dict.get("custom_volume"))
+            row_manual = _roster_normalize_manual_stats(
+                row_dict.get("manual_stats"),
+                hitter=hitter_flag,
+            )
+            pid = _roster_parse_int(row_dict.get("player_id"))
+            if pid is None:
+                cleaned_rows.append(
+                    {
+                        "row_id": row_id,
+                        "player_id": None,
+                        "percentile": row_pct,
+                        "custom_volume": row_custom,
+                        "manual_stats": None,
+                    }
+                )
+                continue
+            if pid in pool_by_id.index and pid not in used_ids:
+                cleaned_rows.append(
+                    {
+                        "row_id": row_id,
+                        "player_id": pid,
+                        "percentile": row_pct,
+                        "custom_volume": row_custom,
+                        "manual_stats": row_manual,
+                    }
+                )
+                used_ids.add(pid)
+            else:
+                cleaned_rows.append(
+                    {
+                        "row_id": row_id,
+                        "player_id": None,
+                        "percentile": row_pct,
+                        "custom_volume": row_custom,
+                        "manual_stats": None,
+                    }
+                )
+                dropped_from_state += 1
+        live_state[reserve_key] = cleaned_rows
+
+    return int(dropped_from_state)
 
 
 def _roster_numeric_from_row(row: pd.Series, col: str) -> float:
@@ -6672,162 +7167,14 @@ def show_roster_manager(
         st.info("Roster Manager requires both two-stage hitter and pitcher datasets.")
         return
 
-    hitter_pool = _build_roster_player_pool(hitters_two_stage, for_pitchers=False)
-    pitcher_pool = _build_roster_player_pool(pitchers_two_stage, for_pitchers=True)
-    if hitter_pool.empty or pitcher_pool.empty:
+    base_hitter_pool = _build_roster_player_pool(hitters_two_stage, for_pitchers=False)
+    base_pitcher_pool = _build_roster_player_pool(pitchers_two_stage, for_pitchers=True)
+    if base_hitter_pool.empty or base_pitcher_pool.empty:
         st.info("Roster Manager player pools are empty after preprocessing.")
         return
-    hitter_pool = hitter_pool.sort_values("label").reset_index(drop=True)
-    pitcher_pool = pitcher_pool.sort_values("label").reset_index(drop=True)
-
-    hitter_pool_by_id = hitter_pool.set_index("mlbid", drop=False)
-    pitcher_pool_by_id = pitcher_pool.set_index("mlbid", drop=False)
-    hitter_tokens_by_id = hitter_pool_by_id["elig_tokens"].to_dict()
-    pitcher_tokens_by_id = pitcher_pool_by_id["elig_tokens"].to_dict()
-    hitter_labels = hitter_pool_by_id["label"].to_dict()
-    pitcher_labels = pitcher_pool_by_id["label"].to_dict()
-    hitter_ids_sorted = hitter_pool["mlbid"].astype(int).tolist()
-    pitcher_ids_sorted = pitcher_pool["mlbid"].astype(int).tolist()
 
     state_key = f"{key_prefix}_state"
-    live_state = st.session_state.get(state_key)
-    if not isinstance(live_state, dict):
-        live_state = _roster_default_state()
-    if not isinstance(live_state.get("starters"), dict):
-        live_state["starters"] = {slot: None for slot in ROSTER_ALL_STARTER_SLOTS}
-    for slot in ROSTER_ALL_STARTER_SLOTS:
-        if slot not in live_state["starters"]:
-            live_state["starters"][slot] = None
-    for reserve_key in ("hitter_reserves", "pitcher_reserves"):
-        if not isinstance(live_state.get(reserve_key), list):
-            live_state[reserve_key] = []
-    next_row_id = _roster_parse_int(live_state.get("next_row_id"))
-    live_state["next_row_id"] = int(next_row_id if (next_row_id is not None and next_row_id >= 1) else 1)
-    default_pct = _roster_norm_percentile(
-        live_state.get("default_percentile", live_state.get("percentile", "p50"))
-    )
-    live_state["default_percentile"] = default_pct
-    live_state["percentile"] = default_pct
-    if not isinstance(live_state.get("starter_percentiles"), dict):
-        live_state["starter_percentiles"] = {}
-    if not isinstance(live_state.get("starter_custom_volume"), dict):
-        live_state["starter_custom_volume"] = {}
-    if not isinstance(live_state.get("starter_manual_stats"), dict):
-        live_state["starter_manual_stats"] = {}
-    for slot in ROSTER_ALL_STARTER_SLOTS:
-        live_state["starter_percentiles"][slot] = _roster_norm_percentile(
-            live_state["starter_percentiles"].get(slot),
-            default=default_pct,
-        )
-        live_state["starter_custom_volume"][slot] = _roster_parse_nonneg_float(
-            live_state["starter_custom_volume"].get(slot)
-        )
-        live_state["starter_manual_stats"][slot] = _roster_normalize_manual_stats(
-            live_state["starter_manual_stats"].get(slot),
-            hitter=(slot in ROSTER_HITTER_STARTER_SLOTS),
-        )
-
-    dropped_from_state = 0
-    used_ids: set[int] = set()
-    for slot in ROSTER_HITTER_STARTER_SLOTS:
-        pid = _roster_parse_int(live_state["starters"].get(slot))
-        if pid is None:
-            live_state["starters"][slot] = None
-            live_state["starter_custom_volume"][slot] = None
-            live_state["starter_manual_stats"][slot] = None
-            continue
-        if (
-            pid in hitter_pool_by_id.index
-            and pid not in used_ids
-            and _roster_hitter_slot_is_eligible(slot, tuple(hitter_tokens_by_id.get(pid, tuple())))
-        ):
-            live_state["starters"][slot] = pid
-            used_ids.add(pid)
-        else:
-            live_state["starters"][slot] = None
-            live_state["starter_custom_volume"][slot] = None
-            live_state["starter_manual_stats"][slot] = None
-            dropped_from_state += 1
-    for slot in ROSTER_PITCHER_STARTER_SLOTS:
-        pid = _roster_parse_int(live_state["starters"].get(slot))
-        if pid is None:
-            live_state["starters"][slot] = None
-            live_state["starter_custom_volume"][slot] = None
-            live_state["starter_manual_stats"][slot] = None
-            continue
-        if (
-            pid in pitcher_pool_by_id.index
-            and pid not in used_ids
-            and _roster_pitcher_slot_is_eligible(slot, tuple(pitcher_tokens_by_id.get(pid, tuple())))
-        ):
-            live_state["starters"][slot] = pid
-            used_ids.add(pid)
-        else:
-            live_state["starters"][slot] = None
-            live_state["starter_custom_volume"][slot] = None
-            live_state["starter_manual_stats"][slot] = None
-            dropped_from_state += 1
-
-    for reserve_key, pool_by_id, hitter_flag in (
-        ("hitter_reserves", hitter_pool_by_id, True),
-        ("pitcher_reserves", pitcher_pool_by_id, False),
-    ):
-        cleaned_rows: list[dict[str, object]] = []
-        for idx, row in enumerate(live_state.get(reserve_key, [])):
-            row_dict = row if isinstance(row, dict) else {"player_id": row}
-            row_id = str(row_dict.get("row_id") or f"{reserve_key}_{idx+1}").strip()
-            if not row_id:
-                row_id = f"{reserve_key}_{idx+1}"
-            row_pct = _roster_norm_percentile(
-                row_dict.get("percentile"),
-                default=default_pct,
-            )
-            row_custom = _roster_parse_nonneg_float(row_dict.get("custom_volume"))
-            row_manual = _roster_normalize_manual_stats(
-                row_dict.get("manual_stats"),
-                hitter=hitter_flag,
-            )
-            pid = _roster_parse_int(row_dict.get("player_id"))
-            if pid is None:
-                cleaned_rows.append(
-                    {
-                        "row_id": row_id,
-                        "player_id": None,
-                        "percentile": row_pct,
-                        "custom_volume": row_custom,
-                        "manual_stats": None,
-                    }
-                )
-                continue
-            if pid in pool_by_id.index and pid not in used_ids:
-                cleaned_rows.append(
-                    {
-                        "row_id": row_id,
-                        "player_id": pid,
-                        "percentile": row_pct,
-                        "custom_volume": row_custom,
-                        "manual_stats": row_manual,
-                    }
-                )
-                used_ids.add(pid)
-            else:
-                cleaned_rows.append(
-                    {
-                        "row_id": row_id,
-                        "player_id": None,
-                        "percentile": row_pct,
-                        "custom_volume": row_custom,
-                        "manual_stats": None,
-                    }
-                )
-                dropped_from_state += 1
-        live_state[reserve_key] = cleaned_rows
-        if hitter_flag and (not isinstance(live_state[reserve_key], list)):
-            live_state[reserve_key] = []
-
-    if dropped_from_state > 0:
-        st.caption(f"Roster Manager normalized {int(dropped_from_state)} invalid/duplicate stored selections.")
-
+    live_state = _roster_prepare_live_state(st.session_state.get(state_key))
     st.session_state[state_key] = live_state
     state = st.session_state[state_key]
 
@@ -6981,8 +7328,8 @@ def show_roster_manager(
                     if raw_roster_state is not None:
                         loaded_state, dropped = _deserialize_roster_state(
                             raw_roster_state,
-                            hitter_pool,
-                            pitcher_pool,
+                            base_hitter_pool,
+                            base_pitcher_pool,
                         )
                         st.session_state[state_key] = loaded_state
                         state = st.session_state[state_key]
@@ -7016,6 +7363,235 @@ def show_roster_manager(
             "This workflow no longer uses in-session/local app saves. "
             "Use `Save current roster JSON` to download and `Load roster JSON` to restore."
         )
+
+    def _render_hitter_manual_inputs(
+        *,
+        row_key: str,
+        defaults: dict[str, float] | None,
+    ) -> dict[str, float]:
+        base_defaults = _roster_normalize_manual_stats(defaults, hitter=True) or {
+            k: 0.0 for k in ROSTER_HITTER_MANUAL_COUNT_STATS
+        }
+        cols = st.columns(6)
+        out: dict[str, float] = {}
+        for idx, stat in enumerate(ROSTER_HITTER_MANUAL_COUNT_STATS):
+            with cols[idx]:
+                out[stat] = float(
+                    st.number_input(
+                        stat,
+                        min_value=0.0,
+                        value=float(base_defaults.get(stat, 0.0)),
+                        step=1.0,
+                        key=f"{key_prefix}_{row_key}_manual_{stat}",
+                    )
+                )
+        derived = _roster_hitter_stats_from_manual(out) or {}
+        st.caption(
+            f"Manual counts (auto AVG): AVG={float(derived.get('AVG', float('nan'))):.3f}"
+        )
+        return out
+
+    def _render_pitcher_manual_inputs(
+        *,
+        row_key: str,
+        defaults: dict[str, float] | None,
+    ) -> dict[str, float]:
+        base_defaults = _roster_normalize_manual_stats(defaults, hitter=False) or {
+            k: 0.0 for k in ROSTER_PITCHER_MANUAL_COUNT_STATS
+        }
+        cols = st.columns(7)
+        out: dict[str, float] = {}
+        for idx, stat in enumerate(ROSTER_PITCHER_MANUAL_COUNT_STATS):
+            with cols[idx]:
+                out[stat] = float(
+                    st.number_input(
+                        stat,
+                        min_value=0.0,
+                        value=float(base_defaults.get(stat, 0.0)),
+                        step=(0.1 if stat == "IP" else 1.0),
+                        key=f"{key_prefix}_{row_key}_manual_{stat}",
+                    )
+                )
+        derived = _roster_pitcher_stats_from_manual(out) or {}
+        whip_val = float(derived.get("WHIP", float("nan")))
+        era_val = float(derived.get("ERA", float("nan")))
+        whip_txt = f"{whip_val:.3f}" if np.isfinite(whip_val) else "n/a"
+        era_txt = f"{era_val:.3f}" if np.isfinite(era_val) else "n/a"
+        st.caption(f"Manual counts (auto WHIP/ERA): WHIP={whip_txt}, ERA={era_txt}")
+        return out
+
+    st.markdown("### Manual Placeholders")
+    st.caption(
+        "Create a hitter or pitcher that is missing from the dataset. "
+        "These placeholders are added to the selector lists below and saved into roster JSON."
+    )
+    placeholder_action_cols = st.columns([1, 1, 4])
+    with placeholder_action_cols[0]:
+        if st.button("Add hitter placeholder", key=f"{key_prefix}_add_custom_hitter"):
+            _roster_add_custom_player(state, hitter=True)
+            st.rerun()
+    with placeholder_action_cols[1]:
+        if st.button("Add pitcher placeholder", key=f"{key_prefix}_add_custom_pitcher"):
+            _roster_add_custom_player(state, hitter=False)
+            st.rerun()
+
+    remove_custom_hitter_id: int | None = None
+    remove_custom_pitcher_id: int | None = None
+
+    for idx, player in enumerate(state.get("custom_hitters", [])):
+        player_id = int(player.get("player_id"))
+        header_cols = st.columns([3, 1, 2, 1, 1])
+        with header_cols[0]:
+            name = st.text_input(
+                f"Hitter Placeholder {idx + 1}",
+                value=str(player.get("name") or ""),
+                key=f"{key_prefix}_custom_h_name_{player_id}",
+            )
+        with header_cols[1]:
+            team = st.text_input(
+                "Team",
+                value=str(player.get("team") or "FA"),
+                key=f"{key_prefix}_custom_h_team_{player_id}",
+            )
+        with header_cols[2]:
+            positions = st.multiselect(
+                "Positions",
+                list(ROSTER_PLACEHOLDER_HITTER_POSITIONS),
+                default=[
+                    tok
+                    for tok in player.get("positions", [])
+                    if tok in set(ROSTER_PLACEHOLDER_HITTER_POSITIONS)
+                ],
+                key=f"{key_prefix}_custom_h_pos_{player_id}",
+                help="Leave all positions empty to make the player UT-only.",
+            )
+        with header_cols[3]:
+            plate_appearances = st.number_input(
+                "PA",
+                min_value=0.0,
+                value=float(_roster_parse_nonneg_float(player.get("plate_appearances")) or 0.0),
+                step=1.0,
+                key=f"{key_prefix}_custom_h_pa_{player_id}",
+            )
+        with header_cols[4]:
+            if st.button("Remove", key=f"{key_prefix}_custom_h_remove_{player_id}"):
+                remove_custom_hitter_id = player_id
+        manual_counts = _render_hitter_manual_inputs(
+            row_key=f"custom_h_{player_id}",
+            defaults=_roster_normalize_placeholder_manual_stats(player.get("manual_stats"), hitter=True),
+        )
+        state["custom_hitters"][idx] = _roster_normalize_custom_player_entry(
+            {
+                "player_id": player_id,
+                "name": name,
+                "team": team,
+                "positions": positions,
+                "plate_appearances": plate_appearances,
+                "manual_stats": manual_counts,
+            },
+            hitter=True,
+        ) or player
+
+    for idx, player in enumerate(state.get("custom_pitchers", [])):
+        player_id = int(player.get("player_id"))
+        header_cols = st.columns([3, 1, 2, 2])
+        with header_cols[0]:
+            name = st.text_input(
+                f"Pitcher Placeholder {idx + 1}",
+                value=str(player.get("name") or ""),
+                key=f"{key_prefix}_custom_p_name_{player_id}",
+            )
+        with header_cols[1]:
+            team = st.text_input(
+                "Team",
+                value=str(player.get("team") or "FA"),
+                key=f"{key_prefix}_custom_p_team_{player_id}",
+            )
+        with header_cols[2]:
+            roles = st.multiselect(
+                "Roles",
+                list(ROSTER_PLACEHOLDER_PITCHER_ROLES),
+                default=[
+                    tok
+                    for tok in player.get("roles", [])
+                    if tok in set(ROSTER_PLACEHOLDER_PITCHER_ROLES)
+                ],
+                key=f"{key_prefix}_custom_p_roles_{player_id}",
+            )
+        with header_cols[3]:
+            if st.button("Remove", key=f"{key_prefix}_custom_p_remove_{player_id}"):
+                remove_custom_pitcher_id = player_id
+        manual_counts = _render_pitcher_manual_inputs(
+            row_key=f"custom_p_{player_id}",
+            defaults=_roster_normalize_placeholder_manual_stats(player.get("manual_stats"), hitter=False),
+        )
+        state["custom_pitchers"][idx] = _roster_normalize_custom_player_entry(
+            {
+                "player_id": player_id,
+                "name": name,
+                "team": team,
+                "roles": roles,
+                "manual_stats": manual_counts,
+            },
+            hitter=False,
+        ) or player
+
+    if remove_custom_hitter_id is not None:
+        state["custom_hitters"] = [
+            player
+            for player in state.get("custom_hitters", [])
+            if _roster_parse_int(player.get("player_id")) != int(remove_custom_hitter_id)
+        ]
+        _roster_clear_player_from_state(state, int(remove_custom_hitter_id))
+        _roster_normalize_custom_players_in_state(state)
+        st.rerun()
+    if remove_custom_pitcher_id is not None:
+        state["custom_pitchers"] = [
+            player
+            for player in state.get("custom_pitchers", [])
+            if _roster_parse_int(player.get("player_id")) != int(remove_custom_pitcher_id)
+        ]
+        _roster_clear_player_from_state(state, int(remove_custom_pitcher_id))
+        _roster_normalize_custom_players_in_state(state)
+        st.rerun()
+
+    _roster_normalize_custom_players_in_state(state)
+    hitter_pool = _combine_roster_player_pools(
+        base_hitter_pool.sort_values("label").reset_index(drop=True),
+        state.get("custom_hitters", []),
+        for_pitchers=False,
+    )
+    pitcher_pool = _combine_roster_player_pools(
+        base_pitcher_pool.sort_values("label").reset_index(drop=True),
+        state.get("custom_pitchers", []),
+        for_pitchers=True,
+    )
+    hitter_pool_by_id = hitter_pool.set_index("mlbid", drop=False)
+    pitcher_pool_by_id = pitcher_pool.set_index("mlbid", drop=False)
+    hitter_tokens_by_id = hitter_pool_by_id["elig_tokens"].to_dict()
+    pitcher_tokens_by_id = pitcher_pool_by_id["elig_tokens"].to_dict()
+    hitter_labels = hitter_pool_by_id["label"].to_dict()
+    pitcher_labels = pitcher_pool_by_id["label"].to_dict()
+    hitter_ids_sorted = hitter_pool["mlbid"].astype(int).tolist()
+    pitcher_ids_sorted = pitcher_pool["mlbid"].astype(int).tolist()
+    hitter_placeholder_ids = {
+        int(player["player_id"]) for player in state.get("custom_hitters", []) if "player_id" in player
+    }
+    pitcher_placeholder_ids = {
+        int(player["player_id"]) for player in state.get("custom_pitchers", []) if "player_id" in player
+    }
+
+    dropped_from_state = _roster_validate_live_state(
+        state,
+        hitter_pool_by_id=hitter_pool_by_id,
+        pitcher_pool_by_id=pitcher_pool_by_id,
+        hitter_tokens_by_id=hitter_tokens_by_id,
+        pitcher_tokens_by_id=pitcher_tokens_by_id,
+    )
+    if dropped_from_state > 0:
+        _roster_reset_ui_widget_state(key_prefix)
+        _prime_widget_state_from_roster_state()
+        st.caption(f"Roster Manager normalized {int(dropped_from_state)} invalid/duplicate stored selections.")
 
     def _starter_candidate_ids(slot: str, *, hitter: bool, current_id: int | None) -> list[int]:
         blocked = _roster_selected_player_ids(state)
@@ -7150,62 +7726,6 @@ def show_roster_manager(
                 out_stats["ERA"] = float("nan")
         return out_stats
 
-    def _render_hitter_manual_inputs(
-        *,
-        row_key: str,
-        defaults: dict[str, float] | None,
-    ) -> dict[str, float]:
-        base_defaults = _roster_normalize_manual_stats(defaults, hitter=True) or {
-            k: 0.0 for k in ROSTER_HITTER_MANUAL_COUNT_STATS
-        }
-        cols = st.columns(6)
-        out: dict[str, float] = {}
-        for idx, stat in enumerate(ROSTER_HITTER_MANUAL_COUNT_STATS):
-            with cols[idx]:
-                out[stat] = float(
-                    st.number_input(
-                        stat,
-                        min_value=0.0,
-                        value=float(base_defaults.get(stat, 0.0)),
-                        step=1.0,
-                        key=f"{key_prefix}_{row_key}_manual_{stat}",
-                    )
-                )
-        derived = _roster_hitter_stats_from_manual(out) or {}
-        st.caption(
-            f"Manual counts (auto AVG): AVG={float(derived.get('AVG', float('nan'))):.3f}"
-        )
-        return out
-
-    def _render_pitcher_manual_inputs(
-        *,
-        row_key: str,
-        defaults: dict[str, float] | None,
-    ) -> dict[str, float]:
-        base_defaults = _roster_normalize_manual_stats(defaults, hitter=False) or {
-            k: 0.0 for k in ROSTER_PITCHER_MANUAL_COUNT_STATS
-        }
-        cols = st.columns(7)
-        out: dict[str, float] = {}
-        for idx, stat in enumerate(ROSTER_PITCHER_MANUAL_COUNT_STATS):
-            with cols[idx]:
-                out[stat] = float(
-                    st.number_input(
-                        stat,
-                        min_value=0.0,
-                        value=float(base_defaults.get(stat, 0.0)),
-                        step=(0.1 if stat == "IP" else 1.0),
-                        key=f"{key_prefix}_{row_key}_manual_{stat}",
-                    )
-                )
-        derived = _roster_pitcher_stats_from_manual(out) or {}
-        whip_val = float(derived.get("WHIP", float("nan")))
-        era_val = float(derived.get("ERA", float("nan")))
-        whip_txt = f"{whip_val:.3f}" if np.isfinite(whip_val) else "n/a"
-        era_txt = f"{era_val:.3f}" if np.isfinite(era_val) else "n/a"
-        st.caption(f"Manual counts (auto WHIP/ERA): WHIP={whip_txt}, ERA={era_txt}")
-        return out
-
     st.markdown("### Hitters (Starters)")
     st.caption("Custom PA/IP lets you override projected volume while keeping each player's projected rates.")
     hitter_rows: list[dict[str, object]] = []
@@ -7331,6 +7851,7 @@ def show_roster_manager(
             "Pct": (
                 "MANUAL"
                 if state.get("starter_manual_stats", {}).get(slot) is not None
+                or (picked_id in hitter_placeholder_ids)
                 else str(state["starter_percentiles"][slot]).upper()
             ),
             "Player": _roster_display_pick_label(picked_id, hitter_labels, empty_label=""),
@@ -7603,7 +8124,11 @@ def show_roster_manager(
         row_manual_stats = _roster_hitter_stats_from_manual(row.get("manual_stats"))
         row_out: dict[str, object] = {
             "Reserve Slot": f"H{idx + 1}",
-            "Pct": ("MANUAL" if row_manual_stats is not None else str(row_pct).upper()),
+            "Pct": (
+                "MANUAL"
+                if (row_manual_stats is not None) or (pid in hitter_placeholder_ids)
+                else str(row_pct).upper()
+            ),
             "Player": _roster_display_pick_label(pid, hitter_labels, empty_label=""),
         }
         for stat in ROSTER_HITTER_STATS:
@@ -7746,6 +8271,7 @@ def show_roster_manager(
             "Pct": (
                 "MANUAL"
                 if state.get("starter_manual_stats", {}).get(slot) is not None
+                or (picked_id in pitcher_placeholder_ids)
                 else str(state["starter_percentiles"][slot]).upper()
             ),
             "Player": _roster_display_pick_label(picked_id, pitcher_labels, empty_label=""),
@@ -8023,7 +8549,11 @@ def show_roster_manager(
         row_manual_stats = _roster_pitcher_stats_from_manual(row.get("manual_stats"))
         row_out: dict[str, object] = {
             "Reserve Slot": f"P{idx + 1}",
-            "Pct": ("MANUAL" if row_manual_stats is not None else str(row_pct).upper()),
+            "Pct": (
+                "MANUAL"
+                if (row_manual_stats is not None) or (pid in pitcher_placeholder_ids)
+                else str(row_pct).upper()
+            ),
             "Player": _roster_display_pick_label(pid, pitcher_labels, empty_label=""),
         }
         for stat in ROSTER_PITCHER_STATS:
