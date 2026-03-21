@@ -7245,6 +7245,19 @@ def show_roster_manager(
         _prime_widget_state_from_roster_state()
         st.session_state[widget_sync_pending_key] = False
 
+    def _slot_natural_pos(slot: str) -> str:
+        """Return the default position a roster slot should count toward."""
+        natural_map = {
+            "C1": "C", "C2": "C",
+            "1B": "1B", "2B": "2B", "SS": "SS", "3B": "3B",
+            "OF1": "OF", "OF2": "OF", "OF3": "OF", "OF4": "OF", "OF5": "OF",
+            "MI": "2B", "CI": "1B", "UT": "UT",
+            "SP1": "SP", "SP2": "SP", "SP3": "SP", "SP4": "SP",
+            "SP5": "SP", "SP6": "SP", "SP7/RP3": "SP",
+            "RP1": "RP", "RP2": "RP",
+        }
+        return natural_map.get(slot, "UT")
+
     loaded_file_name_key = f"{key_prefix}_external_loaded_file_name"
     export_file_name_key = f"{key_prefix}_external_export_file_name"
     export_name_synced_from_key = f"{key_prefix}_external_export_name_synced_from"
@@ -7350,7 +7363,7 @@ def show_roster_manager(
                         st.session_state[load_notice_key] = " ".join(notices)
                         st.rerun()
     with action_cols[1]:
-        st.caption("Use the save button at the bottom to export current selections.")
+        pass
     with action_cols[2]:
         if st.button("Clear roster", key=f"{key_prefix}_clear_btn"):
             st.session_state[state_key] = _roster_default_state()
@@ -7727,7 +7740,67 @@ def show_roster_manager(
         return out_stats
 
     st.markdown("### Hitters (Starters)")
-    st.caption("Custom PA/IP lets you override projected volume while keeping each player's projected rates.")
+    st.caption("Pick players below — no page refresh until Apply Changes is clicked. Position picker defaults to slot position. Custom PA and manual stats are set after applying.")
+    with st.form(f"{key_prefix}_hitter_starters_form"):
+        for slot in ROSTER_HITTER_STARTER_SLOTS:
+            current_id = _roster_parse_int(state["starters"].get(slot))
+            current_pct = _roster_norm_percentile(
+                state.get("starter_percentiles", {}).get(slot),
+                default=state.get("default_percentile", "p50"),
+            )
+            opt_ids = _starter_candidate_ids(slot, hitter=True, current_id=current_id)
+            options: list[int | None] = [None, *opt_ids]
+            if current_id is not None and current_id not in options:
+                options.append(current_id)
+            default_idx = options.index(current_id) if current_id in options else 0
+            _pos_opts: list[str] = []
+            if current_id is not None and current_id in hitter_pool_by_id.index:
+                _pi_toks = set(hitter_tokens_by_id.get(current_id, tuple()))
+                _pos_opts = [p for p in ["C", "1B", "2B", "SS", "3B", "OF"] if p in _pi_toks]
+                _pos_opts.append("UT")
+            row_cols = st.columns([3, 1, 2])
+            with row_cols[0]:
+                st.selectbox(
+                    slot,
+                    options,
+                    index=default_idx,
+                    key=f"{key_prefix}_starter_h_{slot}",
+                    format_func=lambda v: _roster_display_pick_label(v, hitter_labels, empty_label="(empty)"),
+                )
+            with row_cols[1]:
+                st.selectbox(
+                    f"{slot} pct",
+                    list(ROSTER_PERCENTILE_OPTIONS),
+                    index=list(ROSTER_PERCENTILE_OPTIONS).index(current_pct),
+                    key=f"{key_prefix}_starter_h_pct_{slot}",
+                    label_visibility="collapsed",
+                )
+            with row_cols[2]:
+                if _pos_opts:
+                    _ekey = f"{key_prefix}_helig_slot_{slot}"
+                    natural = _slot_natural_pos(slot)
+                    default_pos = natural if natural in _pos_opts else _pos_opts[0]
+                    stored_pos = st.session_state.get(_ekey)
+                    valid_pos = stored_pos if stored_pos in _pos_opts else default_pos
+                    st.selectbox(
+                        "Counts toward",
+                        _pos_opts,
+                        index=_pos_opts.index(valid_pos),
+                        key=_ekey,
+                        label_visibility="collapsed",
+                    )
+        _h_starter_apply = st.form_submit_button("Apply Changes", type="primary")
+    if _h_starter_apply:
+        for slot in ROSTER_HITTER_STARTER_SLOTS:
+            state["starters"][slot] = _roster_parse_int(
+                st.session_state.get(f"{key_prefix}_starter_h_{slot}")
+            )
+            state["starter_percentiles"][slot] = _roster_norm_percentile(
+                st.session_state.get(f"{key_prefix}_starter_h_pct_{slot}"),
+                default=state.get("default_percentile", "p50"),
+            )
+        st.rerun()
+
     hitter_rows: list[dict[str, object]] = []
     for slot in ROSTER_HITTER_STARTER_SLOTS:
         current_id = _roster_parse_int(state["starters"].get(slot))
@@ -7742,45 +7815,14 @@ def show_roster_manager(
             state.get("starter_percentiles", {}).get(slot),
             default=state.get("default_percentile", "p50"),
         )
-        opt_ids = _starter_candidate_ids(slot, hitter=True, current_id=current_id)
-        options: list[int | None] = [None, *opt_ids]
-        if current_id is not None and current_id not in options:
-            options.append(current_id)
-        if current_id in options:
-            default_idx = options.index(current_id)
-        else:
-            default_idx = 0
-        row_cols = st.columns([4, 1, 2, 1])
-        with row_cols[0]:
-            picked = st.selectbox(
-                f"{slot}",
-                options,
-                index=default_idx,
-                key=f"{key_prefix}_starter_h_{slot}",
-                format_func=lambda v: _roster_display_pick_label(v, hitter_labels, empty_label="(empty)"),
-            )
-        with row_cols[1]:
-            current_pct = st.selectbox(
-                f"{slot} pct",
-                list(ROSTER_PERCENTILE_OPTIONS),
-                index=list(ROSTER_PERCENTILE_OPTIONS).index(current_pct),
-                key=f"{key_prefix}_starter_h_pct_{slot}",
-                label_visibility="collapsed",
-            )
-        picked_id = _roster_parse_int(picked)
-        if picked_id != current_id:
-            current_custom_pa = None
-            current_manual_stats = None
-        base_pa = float("nan")
-        if picked_id is not None and picked_id in hitter_pool_by_id.index:
+        if current_id is not None and current_id in hitter_pool_by_id.index:
             base_pa = _roster_numeric_from_row(
-                hitter_pool_by_id.loc[int(picked_id)],
-                f"PA_proj_{_roster_norm_percentile(current_pct, default=state.get('default_percentile', 'p50'))}",
+                hitter_pool_by_id.loc[int(current_id)],
+                f"PA_proj_{current_pct}",
             )
-        with row_cols[2]:
             pa_widget_key = (
                 f"{key_prefix}_starter_h_pa_{slot}_"
-                f"{picked_id if picked_id is not None else 'none'}_{current_pct}"
+                f"{current_id}_{current_pct}"
             )
             default_pa_value = current_custom_pa
             if default_pa_value is None:
@@ -7789,31 +7831,26 @@ def show_roster_manager(
                     if (pd.notna(base_pa) and np.isfinite(float(base_pa)) and float(base_pa) >= 0.0)
                     else 0.0
                 )
-            custom_pa_input = st.number_input(
-                f"{slot} PA",
-                min_value=0.0,
-                value=float(default_pa_value),
-                step=1.0,
-                key=pa_widget_key,
-                disabled=(picked_id is None),
-            )
-        with row_cols[3]:
-            use_manual = st.checkbox(
-                f"{slot} manual",
-                value=(current_manual_stats is not None),
-                key=f"{key_prefix}_starter_h_manual_toggle_{slot}",
-                disabled=(picked_id is None),
-                label_visibility="collapsed",
-            )
-        state["starters"][slot] = picked_id
-        state["starter_percentiles"][slot] = _roster_norm_percentile(
-            current_pct,
-            default=state.get("default_percentile", "p50"),
-        )
-        if picked_id is None:
-            state["starter_custom_volume"][slot] = None
-            state["starter_manual_stats"][slot] = None
-        else:
+            vol_cols = st.columns([2, 2, 1])
+            with vol_cols[0]:
+                st.caption(f"**{slot}** — {hitter_labels.get(current_id, str(current_id))}")
+            with vol_cols[1]:
+                custom_pa_input = st.number_input(
+                    f"{slot} PA",
+                    min_value=0.0,
+                    value=float(default_pa_value),
+                    step=1.0,
+                    key=pa_widget_key,
+                    label_visibility="collapsed",
+                )
+            with vol_cols[2]:
+                use_manual = st.checkbox(
+                    f"{slot} manual",
+                    value=(current_manual_stats is not None),
+                    key=f"{key_prefix}_starter_h_manual_toggle_{slot}",
+                    label_visibility="collapsed",
+                )
+            state["starter_percentiles"][slot] = current_pct
             parsed_custom_pa = _roster_parse_nonneg_float(custom_pa_input)
             if (
                 parsed_custom_pa is not None
@@ -7825,8 +7862,8 @@ def show_roster_manager(
             state["starter_custom_volume"][slot] = parsed_custom_pa
             if use_manual:
                 projected_seed = _hitter_stats_for_player(
-                    picked_id,
-                    pct=state["starter_percentiles"][slot],
+                    current_id,
+                    pct=current_pct,
                     custom_pa=state["starter_custom_volume"].get(slot),
                 )
                 seed_manual = current_manual_stats or {
@@ -7846,26 +7883,30 @@ def show_roster_manager(
                 )
             else:
                 state["starter_manual_stats"][slot] = None
+        else:
+            state["starter_custom_volume"][slot] = None
+            state["starter_manual_stats"][slot] = None
+
         row_out: dict[str, object] = {
             "Slot": slot,
             "Pct": (
                 "MANUAL"
                 if state.get("starter_manual_stats", {}).get(slot) is not None
-                or (picked_id in hitter_placeholder_ids)
-                else str(state["starter_percentiles"][slot]).upper()
+                or (current_id in hitter_placeholder_ids)
+                else str(state.get("starter_percentiles", {}).get(slot, "p50")).upper()
             ),
-            "Player": _roster_display_pick_label(picked_id, hitter_labels, empty_label=""),
+            "Player": _roster_display_pick_label(current_id, hitter_labels, empty_label=""),
         }
         for stat in ROSTER_HITTER_STATS:
             row_out[stat] = float("nan")
-        if picked_id is not None and picked_id in hitter_pool_by_id.index:
+        if current_id is not None and current_id in hitter_pool_by_id.index:
             manual_stats = _roster_hitter_stats_from_manual(
                 state.get("starter_manual_stats", {}).get(slot)
             )
             stats = manual_stats or _hitter_stats_for_player(
-                picked_id,
-                pct=state["starter_percentiles"][slot],
-                custom_pa=state["starter_custom_volume"].get(slot),
+                current_id,
+                pct=current_pct,
+                custom_pa=state.get("starter_custom_volume", {}).get(slot),
             )
             for stat in ROSTER_HITTER_STATS:
                 row_out[stat] = stats.get(stat, float("nan"))
@@ -8030,7 +8071,6 @@ def show_roster_manager(
                 default=state.get("default_percentile", "p50"),
             )
         base_pa = float("nan")
-        picked_id = _roster_parse_int(state["hitter_reserves"][idx].get("player_id"))
         if picked_id is not None and picked_id in hitter_pool_by_id.index:
             reserve_pct = _roster_norm_percentile(
                 state["hitter_reserves"][idx].get("percentile"),
@@ -8109,6 +8149,22 @@ def show_roster_manager(
         with row_cols[4]:
             if st.button("Remove", key=f"{key_prefix}_hres_remove_{row_id}"):
                 remove_hitter_idx = idx
+        if picked_id is not None and picked_id in hitter_pool_by_id.index:
+            _hres_toks = set(hitter_tokens_by_id.get(picked_id, tuple()))
+            _hres_elig = [p for p in ["C", "1B", "2B", "SS", "3B", "OF"] if p in _hres_toks]
+            _hres_elig.append("UT")
+            _hres_ekey = f"{key_prefix}_helig_hres_{row_id}"
+            _hres_ecur = st.session_state.get(_hres_ekey)
+            if _hres_ecur not in _hres_elig:
+                _hres_ecur = _hres_elig[0]
+            _hres_pcols = st.columns([3, 9])
+            with _hres_pcols[0]:
+                st.selectbox(
+                    "Count toward",
+                    _hres_elig,
+                    index=_hres_elig.index(_hres_ecur),
+                    key=_hres_ekey,
+                )
     if remove_hitter_idx is not None:
         state["hitter_reserves"].pop(int(remove_hitter_idx))
         st.rerun()
@@ -8151,6 +8207,72 @@ def show_roster_manager(
         st.caption("No hitter reserves yet.")
 
     st.markdown("### Pitchers (Starters)")
+    st.caption("Pick players below — no page refresh until Apply Changes is clicked. Role picker defaults to slot role. Custom IP and manual stats are set after applying.")
+    with st.form(f"{key_prefix}_pitcher_starters_form"):
+        for slot in ROSTER_PITCHER_STARTER_SLOTS:
+            current_id = _roster_parse_int(state["starters"].get(slot))
+            current_pct = _roster_norm_percentile(
+                state.get("starter_percentiles", {}).get(slot),
+                default=state.get("default_percentile", "p50"),
+            )
+            opt_ids = _starter_candidate_ids(slot, hitter=False, current_id=current_id)
+            options: list[int | None] = [None, *opt_ids]
+            if current_id is not None and current_id not in options:
+                options.append(current_id)
+            default_idx = options.index(current_id) if current_id in options else 0
+            _role_opts: list[str] = []
+            if current_id is not None and current_id in pitcher_pool_by_id.index:
+                _pp_toks = set(pitcher_tokens_by_id.get(current_id, tuple()))
+                _role_opts = [p for p in ["SP", "RP"] if p in _pp_toks]
+                if not _role_opts:
+                    _role_opts = ["SP", "RP"]
+            row_cols = st.columns([3, 1, 2])
+            with row_cols[0]:
+                st.selectbox(
+                    slot,
+                    options,
+                    index=default_idx,
+                    key=f"{key_prefix}_starter_p_{slot}",
+                    format_func=lambda v: _roster_display_pick_label(v, pitcher_labels, empty_label="(empty)"),
+                )
+            with row_cols[1]:
+                st.selectbox(
+                    f"{slot} pct",
+                    list(ROSTER_PERCENTILE_OPTIONS),
+                    index=list(ROSTER_PERCENTILE_OPTIONS).index(current_pct),
+                    key=f"{key_prefix}_starter_p_pct_{slot}",
+                    label_visibility="collapsed",
+                )
+            with row_cols[2]:
+                if len(_role_opts) > 1:
+                    _rekey = f"{key_prefix}_pelig_slot_{slot}"
+                    natural_role = _slot_natural_pos(slot)
+                    default_role = natural_role if natural_role in _role_opts else _role_opts[0]
+                    stored_role = st.session_state.get(_rekey)
+                    valid_role = stored_role if stored_role in _role_opts else default_role
+                    st.selectbox(
+                        "Counts toward",
+                        _role_opts,
+                        index=_role_opts.index(valid_role),
+                        key=_rekey,
+                        label_visibility="collapsed",
+                    )
+                elif _role_opts:
+                    st.caption(_role_opts[0])
+                else:
+                    st.empty()
+        _p_starter_apply = st.form_submit_button("Apply Changes", type="primary")
+    if _p_starter_apply:
+        for slot in ROSTER_PITCHER_STARTER_SLOTS:
+            state["starters"][slot] = _roster_parse_int(
+                st.session_state.get(f"{key_prefix}_starter_p_{slot}")
+            )
+            state["starter_percentiles"][slot] = _roster_norm_percentile(
+                st.session_state.get(f"{key_prefix}_starter_p_pct_{slot}"),
+                default=state.get("default_percentile", "p50"),
+            )
+        st.rerun()
+
     pitcher_rows: list[dict[str, object]] = []
     for slot in ROSTER_PITCHER_STARTER_SLOTS:
         current_id = _roster_parse_int(state["starters"].get(slot))
@@ -8165,42 +8287,14 @@ def show_roster_manager(
             state.get("starter_percentiles", {}).get(slot),
             default=state.get("default_percentile", "p50"),
         )
-        opt_ids = _starter_candidate_ids(slot, hitter=False, current_id=current_id)
-        options: list[int | None] = [None, *opt_ids]
-        if current_id is not None and current_id not in options:
-            options.append(current_id)
-        default_idx = options.index(current_id) if current_id in options else 0
-        row_cols = st.columns([4, 1, 2, 1])
-        with row_cols[0]:
-            picked = st.selectbox(
-                f"{slot}",
-                options,
-                index=default_idx,
-                key=f"{key_prefix}_starter_p_{slot}",
-                format_func=lambda v: _roster_display_pick_label(v, pitcher_labels, empty_label="(empty)"),
-            )
-        with row_cols[1]:
-            current_pct = st.selectbox(
-                f"{slot} pct",
-                list(ROSTER_PERCENTILE_OPTIONS),
-                index=list(ROSTER_PERCENTILE_OPTIONS).index(current_pct),
-                key=f"{key_prefix}_starter_p_pct_{slot}",
-                label_visibility="collapsed",
-            )
-        picked_id = _roster_parse_int(picked)
-        if picked_id != current_id:
-            current_custom_ip = None
-            current_manual_stats = None
-        base_ip = float("nan")
-        if picked_id is not None and picked_id in pitcher_pool_by_id.index:
+        if current_id is not None and current_id in pitcher_pool_by_id.index:
             base_ip = _roster_numeric_from_row(
-                pitcher_pool_by_id.loc[int(picked_id)],
-                f"IP_proj_{_roster_norm_percentile(current_pct, default=state.get('default_percentile', 'p50'))}",
+                pitcher_pool_by_id.loc[int(current_id)],
+                f"IP_proj_{current_pct}",
             )
-        with row_cols[2]:
             ip_widget_key = (
                 f"{key_prefix}_starter_p_ip_{slot}_"
-                f"{picked_id if picked_id is not None else 'none'}_{current_pct}"
+                f"{current_id}_{current_pct}"
             )
             default_ip_value = current_custom_ip
             if default_ip_value is None:
@@ -8209,31 +8303,26 @@ def show_roster_manager(
                     if (pd.notna(base_ip) and np.isfinite(float(base_ip)) and float(base_ip) >= 0.0)
                     else 0.0
                 )
-            custom_ip_input = st.number_input(
-                f"{slot} IP",
-                min_value=0.0,
-                value=float(default_ip_value),
-                step=0.1,
-                key=ip_widget_key,
-                disabled=(picked_id is None),
-            )
-        with row_cols[3]:
-            use_manual = st.checkbox(
-                f"{slot} manual",
-                value=(current_manual_stats is not None),
-                key=f"{key_prefix}_starter_p_manual_toggle_{slot}",
-                disabled=(picked_id is None),
-                label_visibility="collapsed",
-            )
-        state["starters"][slot] = picked_id
-        state["starter_percentiles"][slot] = _roster_norm_percentile(
-            current_pct,
-            default=state.get("default_percentile", "p50"),
-        )
-        if picked_id is None:
-            state["starter_custom_volume"][slot] = None
-            state["starter_manual_stats"][slot] = None
-        else:
+            vol_cols = st.columns([2, 2, 1])
+            with vol_cols[0]:
+                st.caption(f"**{slot}** — {pitcher_labels.get(current_id, str(current_id))}")
+            with vol_cols[1]:
+                custom_ip_input = st.number_input(
+                    f"{slot} IP",
+                    min_value=0.0,
+                    value=float(default_ip_value),
+                    step=0.1,
+                    key=ip_widget_key,
+                    label_visibility="collapsed",
+                )
+            with vol_cols[2]:
+                use_manual = st.checkbox(
+                    f"{slot} manual",
+                    value=(current_manual_stats is not None),
+                    key=f"{key_prefix}_starter_p_manual_toggle_{slot}",
+                    label_visibility="collapsed",
+                )
+            state["starter_percentiles"][slot] = current_pct
             parsed_custom_ip = _roster_parse_nonneg_float(custom_ip_input)
             if (
                 parsed_custom_ip is not None
@@ -8245,8 +8334,8 @@ def show_roster_manager(
             state["starter_custom_volume"][slot] = parsed_custom_ip
             if use_manual:
                 projected_seed = _pitcher_stats_for_player(
-                    picked_id,
-                    pct=state["starter_percentiles"][slot],
+                    current_id,
+                    pct=current_pct,
                     custom_ip=state["starter_custom_volume"].get(slot),
                 )
                 seed_manual = current_manual_stats or {
@@ -8266,26 +8355,30 @@ def show_roster_manager(
                 )
             else:
                 state["starter_manual_stats"][slot] = None
+        else:
+            state["starter_custom_volume"][slot] = None
+            state["starter_manual_stats"][slot] = None
+
         row_out: dict[str, object] = {
             "Slot": slot,
             "Pct": (
                 "MANUAL"
                 if state.get("starter_manual_stats", {}).get(slot) is not None
-                or (picked_id in pitcher_placeholder_ids)
-                else str(state["starter_percentiles"][slot]).upper()
+                or (current_id in pitcher_placeholder_ids)
+                else str(state.get("starter_percentiles", {}).get(slot, "p50")).upper()
             ),
-            "Player": _roster_display_pick_label(picked_id, pitcher_labels, empty_label=""),
+            "Player": _roster_display_pick_label(current_id, pitcher_labels, empty_label=""),
         }
         for stat in ROSTER_PITCHER_STATS:
             row_out[stat] = float("nan")
-        if picked_id is not None and picked_id in pitcher_pool_by_id.index:
+        if current_id is not None and current_id in pitcher_pool_by_id.index:
             manual_stats = _roster_pitcher_stats_from_manual(
                 state.get("starter_manual_stats", {}).get(slot)
             )
             stats = manual_stats or _pitcher_stats_for_player(
-                picked_id,
-                pct=state["starter_percentiles"][slot],
-                custom_ip=state["starter_custom_volume"].get(slot),
+                current_id,
+                pct=current_pct,
+                custom_ip=state.get("starter_custom_volume", {}).get(slot),
             )
             for stat in ROSTER_PITCHER_STATS:
                 row_out[stat] = stats.get(stat, float("nan"))
@@ -8455,7 +8548,6 @@ def show_roster_manager(
                 default=state.get("default_percentile", "p50"),
             )
         base_ip = float("nan")
-        picked_id = _roster_parse_int(state["pitcher_reserves"][idx].get("player_id"))
         if picked_id is not None and picked_id in pitcher_pool_by_id.index:
             reserve_pct = _roster_norm_percentile(
                 state["pitcher_reserves"][idx].get("percentile"),
@@ -8534,6 +8626,24 @@ def show_roster_manager(
         with row_cols[4]:
             if st.button("Remove", key=f"{key_prefix}_pres_remove_{row_id}"):
                 remove_pitcher_idx = idx
+        if picked_id is not None and picked_id in pitcher_pool_by_id.index:
+            _pres_toks = set(pitcher_tokens_by_id.get(picked_id, tuple()))
+            _pres_elig = [p for p in ["SP", "RP"] if p in _pres_toks]
+            if not _pres_elig:
+                _pres_elig = ["SP", "RP"]
+            if len(_pres_elig) > 1:
+                _pres_ekey = f"{key_prefix}_pelig_pres_{row_id}"
+                _pres_ecur = st.session_state.get(_pres_ekey)
+                if _pres_ecur not in _pres_elig:
+                    _pres_ecur = _pres_elig[0]
+                _pres_pcols = st.columns([3, 9])
+                with _pres_pcols[0]:
+                    st.selectbox(
+                        "Role",
+                        _pres_elig,
+                        index=_pres_elig.index(_pres_ecur),
+                        key=_pres_ekey,
+                    )
     if remove_pitcher_idx is not None:
         state["pitcher_reserves"].pop(int(remove_pitcher_idx))
         st.rerun()
@@ -8577,28 +8687,80 @@ def show_roster_manager(
     else:
         st.caption("No pitcher reserves yet.")
 
-    hitter_selected_ids = []
+    _hitter_elig_positions = ["C", "1B", "2B", "SS", "3B", "OF", "UT"]
+    st.markdown("### Eligibility Counter")
+    st.caption("Position picker appears next to each committed starter and reserve above. Counts reflect current selections.")
+    elig_counts: dict[str, int] = {pos: 0 for pos in _hitter_elig_positions}
+    hitter_elig_total = 0
     for slot in ROSTER_HITTER_STARTER_SLOTS:
         pid = _roster_parse_int(state["starters"].get(slot))
         if pid is not None and pid in hitter_pool_by_id.index:
-            hitter_selected_ids.append(pid)
-    for row in state.get("hitter_reserves", []):
+            _h_toks = set(hitter_tokens_by_id.get(pid, tuple()))
+            _h_elig = [p for p in ["C", "1B", "2B", "SS", "3B", "OF"] if p in _h_toks]
+            _h_elig.append("UT")
+            _ekey = f"{key_prefix}_helig_slot_{slot}"
+            natural = _slot_natural_pos(slot)
+            default_pos = natural if natural in _h_elig else _h_elig[0]
+            chosen = st.session_state.get(_ekey, default_pos)
+            if chosen not in _h_elig:
+                chosen = default_pos
+            elig_counts[chosen] += 1
+            hitter_elig_total += 1
+    for idx, row in enumerate(state.get("hitter_reserves", [])):
+        _hres_row_id = str(row.get("row_id") or f"hres_{idx+1}")
         pid = _roster_parse_int(row.get("player_id"))
         if pid is not None and pid in hitter_pool_by_id.index:
-            hitter_selected_ids.append(pid)
-
-    elig_counts = {"C": 0, "1B": 0, "2B": 0, "SS": 0, "3B": 0, "OF": 0, "UT": 0}
-    for pid in hitter_selected_ids:
-        toks = set(hitter_tokens_by_id.get(pid, tuple()))
-        for pos in ["C", "1B", "2B", "SS", "3B", "OF"]:
-            if pos in toks:
-                elig_counts[pos] += 1
-        elig_counts["UT"] += 1
+            _h_toks = set(hitter_tokens_by_id.get(pid, tuple()))
+            _h_elig = [p for p in ["C", "1B", "2B", "SS", "3B", "OF"] if p in _h_toks]
+            _h_elig.append("UT")
+            _ekey = f"{key_prefix}_helig_hres_{_hres_row_id}"
+            chosen = st.session_state.get(_ekey, _h_elig[0])
+            if chosen not in _h_elig:
+                chosen = _h_elig[0]
+            elig_counts[chosen] += 1
+            hitter_elig_total += 1
     elig_df = pd.DataFrame(
-        [{"Position": pos, "Eligible Players": int(cnt)} for pos, cnt in [*elig_counts.items(), ("Total", len(hitter_selected_ids))]]
+        [{"Position": pos, "Players": int(cnt)} for pos, cnt in [*elig_counts.items(), ("Total", hitter_elig_total)]]
     )
-    st.markdown("### Eligibility Counter")
     st.dataframe(elig_df, width="stretch", hide_index=True)
+
+    st.markdown("### Pitcher Eligibility Counter")
+    st.caption("Role picker appears next to each committed pitcher starter and reserve above. Counts reflect current selections.")
+    pitcher_elig_counts: dict[str, int] = {"SP": 0, "RP": 0}
+    pitcher_elig_total = 0
+    for slot in ROSTER_PITCHER_STARTER_SLOTS:
+        pid = _roster_parse_int(state["starters"].get(slot))
+        if pid is not None and pid in pitcher_pool_by_id.index:
+            _p_toks = set(pitcher_tokens_by_id.get(pid, tuple()))
+            _p_elig = [p for p in ["SP", "RP"] if p in _p_toks]
+            if not _p_elig:
+                _p_elig = ["SP", "RP"]
+            _rekey = f"{key_prefix}_pelig_slot_{slot}"
+            natural_role = _slot_natural_pos(slot)
+            default_role = natural_role if natural_role in _p_elig else _p_elig[0]
+            chosen = st.session_state.get(_rekey, default_role)
+            if chosen not in pitcher_elig_counts:
+                chosen = default_role
+            pitcher_elig_counts[chosen] += 1
+            pitcher_elig_total += 1
+    for idx, row in enumerate(state.get("pitcher_reserves", [])):
+        _pres_row_id = str(row.get("row_id") or f"pres_{idx+1}")
+        pid = _roster_parse_int(row.get("player_id"))
+        if pid is not None and pid in pitcher_pool_by_id.index:
+            _p_toks = set(pitcher_tokens_by_id.get(pid, tuple()))
+            _p_elig = [p for p in ["SP", "RP"] if p in _p_toks]
+            if not _p_elig:
+                _p_elig = ["SP", "RP"]
+            _rekey = f"{key_prefix}_pelig_pres_{_pres_row_id}"
+            chosen = st.session_state.get(_rekey, _p_elig[0])
+            if chosen not in pitcher_elig_counts:
+                chosen = _p_elig[0]
+            pitcher_elig_counts[chosen] += 1
+            pitcher_elig_total += 1
+    pitcher_elig_df = pd.DataFrame(
+        [{"Position": pos, "Pitchers": int(cnt)} for pos, cnt in [*pitcher_elig_counts.items(), ("Total", pitcher_elig_total)]]
+    )
+    st.dataframe(pitcher_elig_df, width="stretch", hide_index=True)
 
     total_selected = len(_roster_selected_player_ids(state))
     st.caption(

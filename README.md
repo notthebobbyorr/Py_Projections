@@ -69,3 +69,18 @@ streamlit run projection_streamlit.py
 ```
 
 Then use the sidebar `Application` selector to switch between `Projection Sandbox` and `Damage Interface`.
+
+## Changelog
+
+### 2026-03-21 — Roster Manager: st.form Apply Changes + inline position/role pickers (`projection_streamlit.py`)
+
+**Apply Changes via st.form (no page refresh on dropdown interaction)**
+- Hitter and pitcher starter player + pct selections are wrapped in `st.form`; Streamlit does not rerun the page on dropdown interaction inside a form.
+- An "Apply Changes" submit button commits all starter picks and pct selections to state at once, then reruns.
+- Reserve picks remain live (immediate state write) since Add/Remove buttons require reruns outside a form.
+
+**Inline position and role pickers (slot-based)**
+- Each committed hitter starter slot shows a "Counts toward" selectbox (inside the form) listing eligible positions + UT, defaulting to the slot's natural position (e.g., C1→C, MI→2B, CI→1B, UT→UT).
+- Each committed pitcher starter slot shows a "Counts toward" selectbox (SP/RP) inside the form, only visible when the player has dual eligibility; role defaults to slot natural (SP*/RP).
+- Reserve position/role pickers remain live (outside form), keyed by row_id.
+- Eligibility Counter reads from slot-based keys (`_helig_slot_{slot}`, `_pelig_slot_{slot}`) for starters and row_id-based keys for reserves.
