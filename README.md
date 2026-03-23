@@ -72,6 +72,30 @@ Then use the sidebar `Application` selector to switch between `Projection Sandbo
 
 ## Changelog
 
+### 2026-03-23 - Roster Manager: fixed 15-slot reserve tables with st.form; show_table Apply Filters gate (projection_streamlit.py)
+
+**Reserve Manager: fixed 15-slot st.form tables**
+- Hitter and pitcher reserves now always display exactly 15 fixed slots (ROSTER_RESERVE_SLOTS = 15) instead of dynamically added/removed rows.
+- Add/Remove buttons removed; all 15 player+pct selectboxes are inside st.form - no page reruns until Apply Changes is clicked.
+- On Apply: player_id and percentile are committed to state; PA/IP number inputs, position/role picker, and manual stats controls render live beneath the form for committed (non-None) slots only.
+- _roster_default_state() pre-populates 15 empty rows; _roster_prepare_live_state() and _deserialize_roster_state() pad/trim saved rosters to exactly 15 slots for backward compatibility.
+- Widget keys changed from row_id-based to index-based (_hres_pick_{idx}, _pres_pick_{idx}).
+
+**Projection Sandbox show_table: Apply Filters gate**
+- All filter/sort/metrics/percentile widgets inside the show_table controls expander are now wrapped in st.form; no page rerun occurs on individual widget interaction.
+- Apply Filters submit button at the bottom of the controls panel commits all selections at once.
+
+
+
+### 2026-03-22 — Projection Sandbox: st.form Apply Filters gate on show_table controls (`projection_streamlit.py`)
+
+**Apply Filters button on all show_table control panels**
+- All filter/sort/metric/percentile widgets inside each table's controls expander are now wrapped in `st.form`; no page rerun occurs on any individual widget change.
+- An "Apply Filters" submit button (primary) at the bottom of the controls expander commits all selections at once and triggers a single rerun.
+- Affected widgets per table: season, source level, team, opening day status, position, player, min PA/IP quantity, OPS/ERA/WHIP environment checkboxes, percentile selector, metrics selector, sort metric, sort direction.
+- Applies to all `show_table` calls: Hitters tab, Pitchers tab, and any other tab using `show_table`.
+- `_apply_column_filters` (post-table column-level numeric/string filters) remains live outside the form.
+
 ### 2026-03-21 — Roster Manager: st.form Apply Changes + inline position/role pickers (`projection_streamlit.py`)
 
 **Apply Changes via st.form (no page refresh on dropdown interaction)**

@@ -3,7 +3,12 @@
     "allow": [
       "Bash(ls \"C:\\\\Users\\\\orrro\\\\Documents\\\\Py_Projections\"/*.md)",
       "Bash(python -c \"import ast; ast.parse\\(open\\(''projection_streamlit.py''\\).read\\(\\)\\); print\\(''Syntax OK''\\)\")",
-      "Bash(python -c \":*)"
+      "Bash(python -c \":*)",
+      "Bash(python -:*)",
+      "Bash(python -m py_compile projection_streamlit.py)",
+      "Bash(python _patch_hitter_reserves.py)",
+      "Bash(echo \"Exit code: $?\")",
+      "Bash(echo \"Exit: $?\")"
     ]
   }
 }

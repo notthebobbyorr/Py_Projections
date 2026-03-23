@@ -434,6 +434,7 @@ ROSTER_PITCHER_STARTER_SLOTS = [
     "RP2",
 ]
 ROSTER_ALL_STARTER_SLOTS = [*ROSTER_HITTER_STARTER_SLOTS, *ROSTER_PITCHER_STARTER_SLOTS]
+ROSTER_RESERVE_SLOTS = 15  # fixed number of reserve rows shown in the UI
 ROSTER_HITTER_STATS = ["HR", "R", "RBI", "SB", "AVG", "AB", "H"]
 ROSTER_PITCHER_STATS = ["W", "K", "SV", "WHIP", "ERA", "IP", "H", "BB", "ER"]
 ROSTER_HITTER_MANUAL_COUNT_STATS = ["HR", "R", "RBI", "SB", "AB", "H"]
@@ -4280,8 +4281,14 @@ def _roster_default_state() -> dict:
         "starter_percentiles": {slot: default_pct for slot in ROSTER_ALL_STARTER_SLOTS},
         "starter_custom_volume": {slot: None for slot in ROSTER_ALL_STARTER_SLOTS},
         "starter_manual_stats": {slot: None for slot in ROSTER_ALL_STARTER_SLOTS},
-        "hitter_reserves": [],
-        "pitcher_reserves": [],
+        "hitter_reserves": [
+            {"row_id": f"hres_{i+1}", "player_id": None, "percentile": default_pct, "custom_volume": None, "manual_stats": None}
+            for i in range(ROSTER_RESERVE_SLOTS)
+        ],
+        "pitcher_reserves": [
+            {"row_id": f"pres_{i+1}", "player_id": None, "percentile": default_pct, "custom_volume": None, "manual_stats": None}
+            for i in range(ROSTER_RESERVE_SLOTS)
+        ],
         "custom_hitters": [],
         "custom_pitchers": [],
         "next_custom_player_id": -1,
@@ -4847,6 +4854,12 @@ def _deserialize_roster_state(raw_state: object, hitter_pool: pd.DataFrame, pitc
 
     _load_reserves(raw_state.get("hitter_reserves"), hitter=True)
     _load_reserves(raw_state.get("pitcher_reserves"), hitter=False)
+    # Always ensure exactly ROSTER_RESERVE_SLOTS entries in each reserve list.
+    for _rkey in ("hitter_reserves", "pitcher_reserves"):
+        while len(state[_rkey]) < ROSTER_RESERVE_SLOTS:
+            state[_rkey].append({"row_id": None, "player_id": None, "percentile": default_pct, "custom_volume": None, "manual_stats": None})
+        if len(state[_rkey]) > ROSTER_RESERVE_SLOTS:
+            state[_rkey] = state[_rkey][:ROSTER_RESERVE_SLOTS]
     return state, dropped
 
 
@@ -4878,9 +4891,16 @@ def _roster_prepare_live_state(raw_state: object) -> dict:
     for slot in ROSTER_ALL_STARTER_SLOTS:
         if slot not in live_state["starters"]:
             live_state["starters"][slot] = None
-    for reserve_key in ("hitter_reserves", "pitcher_reserves"):
+    _empty_hres = {"row_id": None, "player_id": None, "percentile": "p50", "custom_volume": None, "manual_stats": None}
+    _empty_pres = {"row_id": None, "player_id": None, "percentile": "p50", "custom_volume": None, "manual_stats": None}
+    for reserve_key, empty_row in (("hitter_reserves", _empty_hres), ("pitcher_reserves", _empty_pres)):
         if not isinstance(live_state.get(reserve_key), list):
             live_state[reserve_key] = []
+        # Pad to ROSTER_RESERVE_SLOTS; trim extras beyond that
+        while len(live_state[reserve_key]) < ROSTER_RESERVE_SLOTS:
+            live_state[reserve_key].append(dict(empty_row))
+        if len(live_state[reserve_key]) > ROSTER_RESERVE_SLOTS:
+            live_state[reserve_key] = live_state[reserve_key][:ROSTER_RESERVE_SLOTS]
     next_row_id = _roster_parse_int(live_state.get("next_row_id"))
     live_state["next_row_id"] = int(next_row_id if (next_row_id is not None and next_row_id >= 1) else 1)
     default_pct = _roster_norm_percentile(
@@ -5670,72 +5690,92 @@ def show_table(
     key_root = f"{title}_{key_prefix}".strip("_")
     controls = st.expander(f"{title} controls", expanded=not compact_ui)
     with controls:
-        season_opts = sorted(df["target_season"].dropna().unique().tolist()) if "target_season" in df.columns else []
-        season = st.selectbox(f"{title} season", ["All"] + season_opts, index=0, key=f"{key_root}_season")
-        if season != "All":
-            df = df[df["target_season"] == season]
-
-        if "level_id_source" in df.columns:
-            level_id = pd.to_numeric(df["level_id_source"], errors="coerce").astype("Int64")
-            df = df.assign(level_id_source=level_id)
-            df["source_level"] = df["level_id_source"].map(LEVEL_LABELS).fillna("Other")
-            level_opts = ["All"] + [lvl for lvl in LEVEL_LABELS.values() if lvl in set(df["source_level"].dropna().tolist())]
-            level = st.selectbox(f"{title} source level", level_opts, index=0, key=f"{key_root}_level")
-            if level != "All":
-                df = df[df["source_level"] == level]
-        else:
-            df = _apply_levels_played_filter(
-                df,
-                label=f"{title} source level",
-                key=f"{key_root}_level",
-            )
-
-        df = _apply_team_filter(
-            df,
-            label=f"{title} team",
-            key=f"{key_root}_team",
-        )
-        df = _apply_opening_day_status_filter(
-            df,
-            label=f"{title} Opening Day Status",
-            key=f"{key_root}_opening_day_status",
-        )
-
-        pos_opts = _position_options(df)
-        if len(pos_opts) > 1:
-            selected_positions = st.multiselect(
-                f"{title} position",
-                pos_opts,
-                default=["All"],
-                key=f"{key_root}_position_multi",
-                format_func=lambda v: (
-                    "All" if v == "All" else POSITION_FILTER_LABELS.get(str(v), str(v))
-                ),
-            )
-            df = _filter_by_positions(df, selected_positions)
-        elif "position" in df.columns:
-            pos_values = sorted(df["position"].dropna().astype(str).unique().tolist())
-            position = st.selectbox(
-                f"{title} position",
-                ["All"] + pos_values,
-                index=0,
-                key=f"{key_root}_position",
-            )
-            if position != "All":
-                df = df[df["position"].astype(str) == position]
-
-        if name_col in df.columns:
-            player_names = sorted(df[name_col].dropna().astype(str).unique().tolist())
-            title_l = str(title).strip().lower()
-            supports_custom_player_list = ("hitters" in title_l) or ("pitchers" in title_l)
-            if supports_custom_player_list:
-                player_mode = st.selectbox(
-                    f"{title} player selection",
-                    ["All", "Single", "Custom List"],
-                    index=0,
-                    key=f"{key_root}_player_mode",
+        with st.form(f"{key_root}_controls_form"):
+            season_opts = sorted(df["target_season"].dropna().unique().tolist()) if "target_season" in df.columns else []
+            season = st.selectbox(f"{title} season", ["All"] + season_opts, index=0, key=f"{key_root}_season")
+            if season != "All":
+                df = df[df["target_season"] == season]
+    
+            if "level_id_source" in df.columns:
+                level_id = pd.to_numeric(df["level_id_source"], errors="coerce").astype("Int64")
+                df = df.assign(level_id_source=level_id)
+                df["source_level"] = df["level_id_source"].map(LEVEL_LABELS).fillna("Other")
+                level_opts = ["All"] + [lvl for lvl in LEVEL_LABELS.values() if lvl in set(df["source_level"].dropna().tolist())]
+                level = st.selectbox(f"{title} source level", level_opts, index=0, key=f"{key_root}_level")
+                if level != "All":
+                    df = df[df["source_level"] == level]
+            else:
+                df = _apply_levels_played_filter(
+                    df,
+                    label=f"{title} source level",
+                    key=f"{key_root}_level",
                 )
-                if player_mode == "Single":
+    
+            df = _apply_team_filter(
+                df,
+                label=f"{title} team",
+                key=f"{key_root}_team",
+            )
+            df = _apply_opening_day_status_filter(
+                df,
+                label=f"{title} Opening Day Status",
+                key=f"{key_root}_opening_day_status",
+            )
+    
+            pos_opts = _position_options(df)
+            if len(pos_opts) > 1:
+                selected_positions = st.multiselect(
+                    f"{title} position",
+                    pos_opts,
+                    default=["All"],
+                    key=f"{key_root}_position_multi",
+                    format_func=lambda v: (
+                        "All" if v == "All" else POSITION_FILTER_LABELS.get(str(v), str(v))
+                    ),
+                )
+                df = _filter_by_positions(df, selected_positions)
+            elif "position" in df.columns:
+                pos_values = sorted(df["position"].dropna().astype(str).unique().tolist())
+                position = st.selectbox(
+                    f"{title} position",
+                    ["All"] + pos_values,
+                    index=0,
+                    key=f"{key_root}_position",
+                )
+                if position != "All":
+                    df = df[df["position"].astype(str) == position]
+    
+            if name_col in df.columns:
+                player_names = sorted(df[name_col].dropna().astype(str).unique().tolist())
+                title_l = str(title).strip().lower()
+                supports_custom_player_list = ("hitters" in title_l) or ("pitchers" in title_l)
+                if supports_custom_player_list:
+                    player_mode = st.selectbox(
+                        f"{title} player selection",
+                        ["All", "Single", "Custom List"],
+                        index=0,
+                        key=f"{key_root}_player_mode",
+                    )
+                    if player_mode == "Single":
+                        player = st.selectbox(
+                            f"{title} player",
+                            ["All"] + player_names,
+                            index=0,
+                            key=f"{key_root}_player",
+                        )
+                        if player != "All":
+                            df = df[df[name_col].astype(str) == str(player)]
+                    elif player_mode == "Custom List":
+                        selected_players = st.multiselect(
+                            f"{title} player list",
+                            player_names,
+                            default=[],
+                            key=f"{key_root}_player_list",
+                        )
+                        if selected_players:
+                            selected_set = {str(p) for p in selected_players}
+                            df = df[df[name_col].astype(str).isin(selected_set)]
+                else:
                     player = st.selectbox(
                         f"{title} player",
                         ["All"] + player_names,
@@ -5744,456 +5784,438 @@ def show_table(
                     )
                     if player != "All":
                         df = df[df[name_col].astype(str) == str(player)]
-                elif player_mode == "Custom List":
-                    selected_players = st.multiselect(
-                        f"{title} player list",
-                        player_names,
-                        default=[],
-                        key=f"{key_root}_player_list",
+    
+            quantity_candidates = [
+                ("PA", "PA_proj_p50"),
+                ("BBE", "bbe_proj_p50"),
+                ("TBF", "TBF_marcel_proj_p50"),
+                ("TBF", "TBF_proj_p50"),
+                ("G", "G_marcel_proj_p50"),
+                ("G", "G_proj_p50"),
+                ("IP", "IP_marcel_proj_p50"),
+                ("IP", "IP_proj_p50"),
+                ("GS", "GS_marcel_proj_p50"),
+                ("GS", "GS_proj_p50"),
+            ]
+            available_qty = []
+            seen_labels: set[str] = set()
+            for label, col in quantity_candidates:
+                if col not in df.columns or label in seen_labels:
+                    continue
+                available_qty.append((label, col))
+                seen_labels.add(label)
+            if available_qty:
+                st.caption("Minimum projected quantity filters (P50)")
+            for label, col in available_qty:
+                max_val = float(pd.to_numeric(df[col], errors="coerce").max())
+                if not pd.notna(max_val):
+                    max_val = 0.0
+                step = 1.0 if max_val <= 100 else 5.0
+                min_qty = st.number_input(
+                    f"{title} min {label}",
+                    min_value=0.0,
+                    value=0.0,
+                    step=step,
+                    key=f"{key_root}_min_{col}",
+                )
+                if min_qty > 0:
+                    vals = pd.to_numeric(df[col], errors="coerce")
+                    df = df[vals >= float(min_qty)]
+    
+            if "OPS_proj_p50" in df.columns:
+                source_mu, source_sigma, target_sigma = _ops_env_reference_stats(df)
+                ref_season = _resolve_ops_reference_season(df)
+                if (
+                    np.isfinite(source_mu)
+                    and np.isfinite(source_sigma)
+                    and source_sigma > 1e-12
+                    and np.isfinite(target_sigma)
+                    and target_sigma > 1e-12
+                ):
+                    apply_ops_env = st.checkbox(
+                        f"{title} apply league OPS environment (z-space rescale)",
+                        value=False,
+                        key=f"{key_root}_ops_env_apply",
+                        help=(
+                            "Applies an OPS-anchored z-space environment shift across required "
+                            "underlying rate stats using prior-season reference mu/sigma, then "
+                            "recomputes counting stats and slashline outputs."
+                        ),
                     )
-                    if selected_players:
-                        selected_set = {str(p) for p in selected_players}
-                        df = df[df[name_col].astype(str).isin(selected_set)]
-            else:
-                player = st.selectbox(
-                    f"{title} player",
-                    ["All"] + player_names,
-                    index=0,
-                    key=f"{key_root}_player",
-                )
-                if player != "All":
-                    df = df[df[name_col].astype(str) == str(player)]
-
-        quantity_candidates = [
-            ("PA", "PA_proj_p50"),
-            ("BBE", "bbe_proj_p50"),
-            ("TBF", "TBF_marcel_proj_p50"),
-            ("TBF", "TBF_proj_p50"),
-            ("G", "G_marcel_proj_p50"),
-            ("G", "G_proj_p50"),
-            ("IP", "IP_marcel_proj_p50"),
-            ("IP", "IP_proj_p50"),
-            ("GS", "GS_marcel_proj_p50"),
-            ("GS", "GS_proj_p50"),
-        ]
-        available_qty = []
-        seen_labels: set[str] = set()
-        for label, col in quantity_candidates:
-            if col not in df.columns or label in seen_labels:
-                continue
-            available_qty.append((label, col))
-            seen_labels.add(label)
-        if available_qty:
-            st.caption("Minimum projected quantity filters (P50)")
-        for label, col in available_qty:
-            max_val = float(pd.to_numeric(df[col], errors="coerce").max())
-            if not pd.notna(max_val):
-                max_val = 0.0
-            step = 1.0 if max_val <= 100 else 5.0
-            min_qty = st.number_input(
-                f"{title} min {label}",
-                min_value=0.0,
-                value=0.0,
-                step=step,
-                key=f"{key_root}_min_{col}",
-            )
-            if min_qty > 0:
-                vals = pd.to_numeric(df[col], errors="coerce")
-                df = df[vals >= float(min_qty)]
-
-        if "OPS_proj_p50" in df.columns:
-            source_mu, source_sigma, target_sigma = _ops_env_reference_stats(df)
-            ref_season = _resolve_ops_reference_season(df)
-            if (
-                np.isfinite(source_mu)
-                and np.isfinite(source_sigma)
-                and source_sigma > 1e-12
-                and np.isfinite(target_sigma)
-                and target_sigma > 1e-12
-            ):
-                apply_ops_env = st.checkbox(
-                    f"{title} apply league OPS environment (z-space rescale)",
-                    value=False,
-                    key=f"{key_root}_ops_env_apply",
-                    help=(
-                        "Applies an OPS-anchored z-space environment shift across required "
-                        "underlying rate stats using prior-season reference mu/sigma, then "
-                        "recomputes counting stats and slashline outputs."
-                    ),
-                )
-                ops_env_cols = st.columns(2)
-                with ops_env_cols[0]:
-                    target_ops_median = st.number_input(
-                        f"{title} target league OPS (median)",
-                        min_value=0.0,
-                        max_value=2.5,
-                        value=float(np.round(source_mu, 3)),
-                        step=0.001,
-                        format="%.3f",
-                        key=f"{key_root}_ops_env_target_mu",
+                    ops_env_cols = st.columns(2)
+                    with ops_env_cols[0]:
+                        target_ops_median = st.number_input(
+                            f"{title} target league OPS (median)",
+                            min_value=0.0,
+                            max_value=2.5,
+                            value=float(np.round(source_mu, 3)),
+                            step=0.001,
+                            format="%.3f",
+                            key=f"{key_root}_ops_env_target_mu",
+                        )
+                    with ops_env_cols[1]:
+                        target_ops_sigma = st.number_input(
+                            f"{title} target league OPS sigma",
+                            min_value=0.001,
+                            max_value=1.0,
+                            value=float(np.round(target_sigma, 3)),
+                            step=0.001,
+                            format="%.3f",
+                            key=f"{key_root}_ops_env_target_sigma",
+                        )
+                    ref_season_txt = (
+                        str(int(ref_season))
+                        if ref_season is not None and np.isfinite(ref_season)
+                        else "unknown"
                     )
-                with ops_env_cols[1]:
-                    target_ops_sigma = st.number_input(
-                        f"{title} target league OPS sigma",
-                        min_value=0.001,
-                        max_value=1.0,
-                        value=float(np.round(target_sigma, 3)),
-                        step=0.001,
-                        format="%.3f",
-                        key=f"{key_root}_ops_env_target_sigma",
+                    st.caption(
+                        "OPS environment reference: "
+                        f"source season={ref_season_txt}, "
+                        "source mu=PA-weighted MLB OPS, "
+                        f"source mu value={source_mu:.3f}, "
+                        f"source sigma (mlb_pa>=100)={source_sigma:.3f}, "
+                        f"target sigma={float(target_ops_sigma):.3f}. "
+                        f"Calibration pool uses MLB PA >= {int(MLB_PA_REFERENCE_MIN)} in source season when available."
                     )
-                ref_season_txt = (
-                    str(int(ref_season))
-                    if ref_season is not None and np.isfinite(ref_season)
-                    else "unknown"
-                )
-                st.caption(
-                    "OPS environment reference: "
-                    f"source season={ref_season_txt}, "
-                    "source mu=PA-weighted MLB OPS, "
-                    f"source mu value={source_mu:.3f}, "
-                    f"source sigma (mlb_pa>=100)={source_sigma:.3f}, "
-                    f"target sigma={float(target_ops_sigma):.3f}. "
-                    f"Calibration pool uses MLB PA >= {int(MLB_PA_REFERENCE_MIN)} in source season when available."
-                )
-                if bool(apply_ops_env):
-                    df = _apply_ops_league_environment(
-                        df,
-                        target_ops_median=float(target_ops_median),
-                        target_ops_sigma=float(target_ops_sigma),
-                    )
-                    # Refresh z-columns after OPS override so displayed z is coherent.
-                    df = _add_derived_slashline_metrics(df)
-            else:
-                st.caption(
-                    "OPS environment rescale unavailable: could not derive stable OPS reference distribution."
-                )
-
-        if (
-            "ERA_proj_p50" in df.columns
-            and "ER_per_IP_mlb_eq_non_ar_delta_proj_p50" in df.columns
-        ):
-            source_mu, source_sigma, target_sigma = _era_env_reference_stats(df)
-            ref_season = _resolve_ops_reference_season(df)
-            if (
-                np.isfinite(source_mu)
-                and np.isfinite(source_sigma)
-                and source_sigma > 1e-12
-                and np.isfinite(target_sigma)
-                and target_sigma > 1e-12
-            ):
-                apply_era_env = st.checkbox(
-                    f"{title} apply league ERA environment (z-space rescale)",
-                    value=False,
-                    key=f"{key_root}_era_env_apply",
-                    help=(
-                        "Applies an ERA-anchored z-space environment shift through "
-                        "ER_per_IP projections, then recomputes displayed ERA outputs."
-                    ),
-                )
-                era_env_cols = st.columns(2)
-                with era_env_cols[0]:
-                    target_era_median = st.number_input(
-                        f"{title} target league ERA (median)",
-                        min_value=0.0,
-                        max_value=15.0,
-                        value=float(np.round(source_mu, 3)),
-                        step=0.001,
-                        format="%.3f",
-                        key=f"{key_root}_era_env_target_mu",
-                    )
-                with era_env_cols[1]:
-                    target_era_sigma = st.number_input(
-                        f"{title} target league ERA sigma",
-                        min_value=0.001,
-                        max_value=5.0,
-                        value=float(np.round(target_sigma, 3)),
-                        step=0.001,
-                        format="%.3f",
-                        key=f"{key_root}_era_env_target_sigma",
-                    )
-                ref_season_txt = (
-                    str(int(ref_season))
-                    if ref_season is not None and np.isfinite(ref_season)
-                    else "unknown"
-                )
-                st.caption(
-                    "ERA environment reference: "
-                    f"source season={ref_season_txt}, "
-                    "source mu=IP-weighted MLB ERA, "
-                    f"source mu value={source_mu:.3f}, "
-                    f"source sigma (projected MLB reference)={source_sigma:.3f}, "
-                    f"target sigma={float(target_era_sigma):.3f}. "
-                    f"Calibration pool uses projected IP >= {int(MLB_IP_REFERENCE_MIN)} when available."
-                )
-                if bool(apply_era_env):
-                    df = _apply_era_league_environment(
-                        df,
-                        target_era_median=float(target_era_median),
-                        target_era_sigma=float(target_era_sigma),
-                    )
-            else:
-                st.caption(
-                    "ERA environment rescale unavailable: could not derive stable ERA reference distribution."
-                )
-
-        if "WHIP_proj_p50" in df.columns:
-            source_mu, source_sigma, target_sigma = _whip_env_reference_stats(df)
-            ref_season = _resolve_ops_reference_season(df)
-            if (
-                np.isfinite(source_mu)
-                and np.isfinite(source_sigma)
-                and source_sigma > 1e-12
-                and np.isfinite(target_sigma)
-                and target_sigma > 1e-12
-            ):
-                apply_whip_env = st.checkbox(
-                    f"{title} apply league WHIP environment (z-space rescale)",
-                    value=False,
-                    key=f"{key_root}_whip_env_apply",
-                    help=(
-                        "Applies a WHIP-anchored z-space environment shift through "
-                        "WHIP projections."
-                    ),
-                )
-                whip_env_cols = st.columns(2)
-                with whip_env_cols[0]:
-                    target_whip_median = st.number_input(
-                        f"{title} target league WHIP (median)",
-                        min_value=0.0,
-                        max_value=5.0,
-                        value=float(np.round(source_mu, 3)),
-                        step=0.001,
-                        format="%.3f",
-                        key=f"{key_root}_whip_env_target_mu",
-                    )
-                with whip_env_cols[1]:
-                    target_whip_sigma = st.number_input(
-                        f"{title} target league WHIP sigma",
-                        min_value=0.001,
-                        max_value=2.0,
-                        value=float(np.round(target_sigma, 3)),
-                        step=0.001,
-                        format="%.3f",
-                        key=f"{key_root}_whip_env_target_sigma",
-                    )
-                ref_season_txt = (
-                    str(int(ref_season))
-                    if ref_season is not None and np.isfinite(ref_season)
-                    else "unknown"
-                )
-                st.caption(
-                    "WHIP environment reference: "
-                    f"source season={ref_season_txt}, "
-                    "source mu=IP-weighted MLB WHIP, "
-                    f"source mu value={source_mu:.3f}, "
-                    f"source sigma (projected MLB reference)={source_sigma:.3f}, "
-                    f"target sigma={float(target_whip_sigma):.3f}. "
-                    f"Calibration pool uses projected IP >= {int(MLB_IP_REFERENCE_MIN)} when available."
-                )
-                if bool(apply_whip_env):
-                    df = _apply_whip_league_environment(
-                        df,
-                        target_whip_median=float(target_whip_median),
-                        target_whip_sigma=float(target_whip_sigma),
-                    )
-            else:
-                st.caption(
-                    "WHIP environment rescale unavailable: could not derive stable WHIP reference distribution."
-                )
-
-        metric_bases_all = sorted(
-            c[: -len("_proj_p50")] for c in df.columns if c.endswith("_proj_p50")
-        )
-        metric_base_set = set(metric_bases_all)
-        metric_bases = [
-            m
-            for m in metric_bases_all
-            if not (m.endswith("_reg") and (m[: -len("_reg")] in metric_base_set))
-        ]
-        pct_choices = st.multiselect(
-            f"{title} percentiles",
-            ["P20", "P25", "P50", "P75", "P80", "P600", "Spread"],
-            default=["P50", "P25", "P75"],
-            key=f"{key_root}_pct_cols",
-        )
-        bp_default_order = [
-            "Points",
-            "SGP",
-            "Points/PA",
-            "PA",
-            "AB",
-            "H",
-            "HR",
-            "Runs",
-            "RBI",
-            "SB",
-            "CS",
-            "K%",
-            "BB%",
-            "AVG",
-            "OBP",
-            "SLG",
-            "OPS",
-            "babip_recalc_rate_mlb_eq_non_ar_delta",
-            "ISO",
-        ]
-        pitching_default_order = [
-            "Points",
-            "SGP",
-            "Points/IP",
-            "G",
-            "GS",
-            "IP",
-            "TBF",
-            "ERA",
-            "WHIP",
-            "SO",
-            "W",
-            "SV",
-            "BB",
-            "H",
-            "HR",
-            "HBP",
-            "K%",
-            "BB%",
-            "K-BB%",
-            "BABIP",
-            "Whiff%",
-            "HR/BBE%",
-            "GB%",
-        ]
-        pitcher_kpi_default_order = [
-            "Points",
-            "SGP",
-            "Points/IP",
-            "TBF",
-            "IP",
-            "GS",
-            "stuff_raw",
-            "stuff_raw_reg",
-            "fastball_velo_reg",
-            "max_velo_reg",
-            "fastball_vaa_reg",
-            "FA_pct_reg",
-            "BB_rpm_reg",
-            "SwStr_reg",
-            "Zone_reg",
-            "Ball_pct_reg",
-            "Z_Contact_reg",
-            "Chase_reg",
-            "CSW_reg",
-            "LA_gte_20_reg",
-            "LA_lte_0_reg",
-            "rel_z_reg",
-            "rel_x_reg",
-            "ext_reg",
-        ]
-        kpi_default_order = [
-            "Points",
-            "SGP",
-            "Points/PA",
-            "PA",
-            "bbe",
-            "damage_rate",
-            "EV90th",
-            "max_EV",
-            "SEAGER",
-            "pull_FB_pct",
-            "LA_gte_20",
-            "LA_lte_0",
-            "selection_skill",
-            "hittable_pitches_taken",
-            "chase",
-            "z_con",
-            "secondary_whiff_pct",
-            "whiffs_vs_95",
-            "contact_vs_avg",
-        ]
-        kpi_signature = {
-            "damage_rate",
-            "EV90th",
-            "max_EV",
-            "SEAGER",
-            "chase",
-            "z_con",
-            "damage_rate_reg",
-            "EV90th_reg",
-            "max_EV_reg",
-            "SEAGER_reg",
-            "chase_reg",
-            "z_con_reg",
-        }
-        use_kpi_defaults = bool(prefer_kpi_defaults) and (
-            sum(1 for m in kpi_signature if m in metric_bases) >= 4
-        )
-        is_pitching_dataset = _looks_like_pitching_metric_set(metric_bases)
-        is_pitcher_kpi_dataset = _looks_like_pitcher_kpi_metric_set(metric_bases)
-        if is_pitcher_kpi_dataset:
-            requested_default_order = pitcher_kpi_default_order
-        elif use_kpi_defaults:
-            requested_default_order = kpi_default_order
-        elif is_pitching_dataset:
-            requested_default_order = pitching_default_order
-        else:
-            requested_default_order = bp_default_order
-        if is_pitching_dataset:
-            requested_default_order = _prefer_marcel_volume_bases(requested_default_order)
-        default_metrics = [m for m in requested_default_order if m in metric_bases]
-        if not default_metrics:
-            default_metrics = metric_bases[:10]
-        selected_metrics = st.multiselect(
-            f"{title} metrics",
-            metric_bases,
-            default=default_metrics,
-            key=f"{key_root}_metrics",
-        )
-        if (
-            not bool(prefer_kpi_defaults)
-            and set(selected_metrics) == {"PA"}
-            and len(default_metrics) > 1
-        ):
-            selected_metrics = list(default_metrics)
-
-        metric_order = [m for m in requested_default_order if m in selected_metrics]
-        metric_order += [m for m in selected_metrics if m not in metric_order]
-
-        sort_options = list(selected_metrics)
-        for metric_name in ["Points/PA", "Points/IP"]:
-            col_name = f"{metric_name}_proj_p50"
-            if col_name in df.columns and metric_name not in sort_options:
-                sort_options.append(metric_name)
-        if "ADP" in df.columns:
-            sort_options.append("ADP")
-        if sort_options and "P50" in pct_choices:
-            if is_pitching_dataset:
-                if "K-BB%" in selected_metrics:
-                    sort_default_idx = selected_metrics.index("K-BB%")
-                elif "IP_marcel" in selected_metrics:
-                    sort_default_idx = selected_metrics.index("IP_marcel")
-                elif "IP" in selected_metrics:
-                    sort_default_idx = selected_metrics.index("IP")
+                    if bool(apply_ops_env):
+                        df = _apply_ops_league_environment(
+                            df,
+                            target_ops_median=float(target_ops_median),
+                            target_ops_sigma=float(target_ops_sigma),
+                        )
+                        # Refresh z-columns after OPS override so displayed z is coherent.
+                        df = _add_derived_slashline_metrics(df)
                 else:
-                    sort_default_idx = 0
+                    st.caption(
+                        "OPS environment rescale unavailable: could not derive stable OPS reference distribution."
+                    )
+    
+            if (
+                "ERA_proj_p50" in df.columns
+                and "ER_per_IP_mlb_eq_non_ar_delta_proj_p50" in df.columns
+            ):
+                source_mu, source_sigma, target_sigma = _era_env_reference_stats(df)
+                ref_season = _resolve_ops_reference_season(df)
+                if (
+                    np.isfinite(source_mu)
+                    and np.isfinite(source_sigma)
+                    and source_sigma > 1e-12
+                    and np.isfinite(target_sigma)
+                    and target_sigma > 1e-12
+                ):
+                    apply_era_env = st.checkbox(
+                        f"{title} apply league ERA environment (z-space rescale)",
+                        value=False,
+                        key=f"{key_root}_era_env_apply",
+                        help=(
+                            "Applies an ERA-anchored z-space environment shift through "
+                            "ER_per_IP projections, then recomputes displayed ERA outputs."
+                        ),
+                    )
+                    era_env_cols = st.columns(2)
+                    with era_env_cols[0]:
+                        target_era_median = st.number_input(
+                            f"{title} target league ERA (median)",
+                            min_value=0.0,
+                            max_value=15.0,
+                            value=float(np.round(source_mu, 3)),
+                            step=0.001,
+                            format="%.3f",
+                            key=f"{key_root}_era_env_target_mu",
+                        )
+                    with era_env_cols[1]:
+                        target_era_sigma = st.number_input(
+                            f"{title} target league ERA sigma",
+                            min_value=0.001,
+                            max_value=5.0,
+                            value=float(np.round(target_sigma, 3)),
+                            step=0.001,
+                            format="%.3f",
+                            key=f"{key_root}_era_env_target_sigma",
+                        )
+                    ref_season_txt = (
+                        str(int(ref_season))
+                        if ref_season is not None and np.isfinite(ref_season)
+                        else "unknown"
+                    )
+                    st.caption(
+                        "ERA environment reference: "
+                        f"source season={ref_season_txt}, "
+                        "source mu=IP-weighted MLB ERA, "
+                        f"source mu value={source_mu:.3f}, "
+                        f"source sigma (projected MLB reference)={source_sigma:.3f}, "
+                        f"target sigma={float(target_era_sigma):.3f}. "
+                        f"Calibration pool uses projected IP >= {int(MLB_IP_REFERENCE_MIN)} when available."
+                    )
+                    if bool(apply_era_env):
+                        df = _apply_era_league_environment(
+                            df,
+                            target_era_median=float(target_era_median),
+                            target_era_sigma=float(target_era_sigma),
+                        )
+                else:
+                    st.caption(
+                        "ERA environment rescale unavailable: could not derive stable ERA reference distribution."
+                    )
+    
+            if "WHIP_proj_p50" in df.columns:
+                source_mu, source_sigma, target_sigma = _whip_env_reference_stats(df)
+                ref_season = _resolve_ops_reference_season(df)
+                if (
+                    np.isfinite(source_mu)
+                    and np.isfinite(source_sigma)
+                    and source_sigma > 1e-12
+                    and np.isfinite(target_sigma)
+                    and target_sigma > 1e-12
+                ):
+                    apply_whip_env = st.checkbox(
+                        f"{title} apply league WHIP environment (z-space rescale)",
+                        value=False,
+                        key=f"{key_root}_whip_env_apply",
+                        help=(
+                            "Applies a WHIP-anchored z-space environment shift through "
+                            "WHIP projections."
+                        ),
+                    )
+                    whip_env_cols = st.columns(2)
+                    with whip_env_cols[0]:
+                        target_whip_median = st.number_input(
+                            f"{title} target league WHIP (median)",
+                            min_value=0.0,
+                            max_value=5.0,
+                            value=float(np.round(source_mu, 3)),
+                            step=0.001,
+                            format="%.3f",
+                            key=f"{key_root}_whip_env_target_mu",
+                        )
+                    with whip_env_cols[1]:
+                        target_whip_sigma = st.number_input(
+                            f"{title} target league WHIP sigma",
+                            min_value=0.001,
+                            max_value=2.0,
+                            value=float(np.round(target_sigma, 3)),
+                            step=0.001,
+                            format="%.3f",
+                            key=f"{key_root}_whip_env_target_sigma",
+                        )
+                    ref_season_txt = (
+                        str(int(ref_season))
+                        if ref_season is not None and np.isfinite(ref_season)
+                        else "unknown"
+                    )
+                    st.caption(
+                        "WHIP environment reference: "
+                        f"source season={ref_season_txt}, "
+                        "source mu=IP-weighted MLB WHIP, "
+                        f"source mu value={source_mu:.3f}, "
+                        f"source sigma (projected MLB reference)={source_sigma:.3f}, "
+                        f"target sigma={float(target_whip_sigma):.3f}. "
+                        f"Calibration pool uses projected IP >= {int(MLB_IP_REFERENCE_MIN)} when available."
+                    )
+                    if bool(apply_whip_env):
+                        df = _apply_whip_league_environment(
+                            df,
+                            target_whip_median=float(target_whip_median),
+                            target_whip_sigma=float(target_whip_sigma),
+                        )
+                else:
+                    st.caption(
+                        "WHIP environment rescale unavailable: could not derive stable WHIP reference distribution."
+                    )
+    
+            metric_bases_all = sorted(
+                c[: -len("_proj_p50")] for c in df.columns if c.endswith("_proj_p50")
+            )
+            metric_base_set = set(metric_bases_all)
+            metric_bases = [
+                m
+                for m in metric_bases_all
+                if not (m.endswith("_reg") and (m[: -len("_reg")] in metric_base_set))
+            ]
+            pct_choices = st.multiselect(
+                f"{title} percentiles",
+                ["P20", "P25", "P50", "P75", "P80", "P600", "Spread"],
+                default=["P50", "P25", "P75"],
+                key=f"{key_root}_pct_cols",
+            )
+            bp_default_order = [
+                "Points",
+                "SGP",
+                "Points/PA",
+                "PA",
+                "AB",
+                "H",
+                "HR",
+                "Runs",
+                "RBI",
+                "SB",
+                "CS",
+                "K%",
+                "BB%",
+                "AVG",
+                "OBP",
+                "SLG",
+                "OPS",
+                "babip_recalc_rate_mlb_eq_non_ar_delta",
+                "ISO",
+            ]
+            pitching_default_order = [
+                "Points",
+                "SGP",
+                "Points/IP",
+                "G",
+                "GS",
+                "IP",
+                "TBF",
+                "ERA",
+                "WHIP",
+                "SO",
+                "W",
+                "SV",
+                "BB",
+                "H",
+                "HR",
+                "HBP",
+                "K%",
+                "BB%",
+                "K-BB%",
+                "BABIP",
+                "Whiff%",
+                "HR/BBE%",
+                "GB%",
+            ]
+            pitcher_kpi_default_order = [
+                "Points",
+                "SGP",
+                "Points/IP",
+                "TBF",
+                "IP",
+                "GS",
+                "stuff_raw",
+                "stuff_raw_reg",
+                "fastball_velo_reg",
+                "max_velo_reg",
+                "fastball_vaa_reg",
+                "FA_pct_reg",
+                "BB_rpm_reg",
+                "SwStr_reg",
+                "Zone_reg",
+                "Ball_pct_reg",
+                "Z_Contact_reg",
+                "Chase_reg",
+                "CSW_reg",
+                "LA_gte_20_reg",
+                "LA_lte_0_reg",
+                "rel_z_reg",
+                "rel_x_reg",
+                "ext_reg",
+            ]
+            kpi_default_order = [
+                "Points",
+                "SGP",
+                "Points/PA",
+                "PA",
+                "bbe",
+                "damage_rate",
+                "EV90th",
+                "max_EV",
+                "SEAGER",
+                "pull_FB_pct",
+                "LA_gte_20",
+                "LA_lte_0",
+                "selection_skill",
+                "hittable_pitches_taken",
+                "chase",
+                "z_con",
+                "secondary_whiff_pct",
+                "whiffs_vs_95",
+                "contact_vs_avg",
+            ]
+            kpi_signature = {
+                "damage_rate",
+                "EV90th",
+                "max_EV",
+                "SEAGER",
+                "chase",
+                "z_con",
+                "damage_rate_reg",
+                "EV90th_reg",
+                "max_EV_reg",
+                "SEAGER_reg",
+                "chase_reg",
+                "z_con_reg",
+            }
+            use_kpi_defaults = bool(prefer_kpi_defaults) and (
+                sum(1 for m in kpi_signature if m in metric_bases) >= 4
+            )
+            is_pitching_dataset = _looks_like_pitching_metric_set(metric_bases)
+            is_pitcher_kpi_dataset = _looks_like_pitcher_kpi_metric_set(metric_bases)
+            if is_pitcher_kpi_dataset:
+                requested_default_order = pitcher_kpi_default_order
+            elif use_kpi_defaults:
+                requested_default_order = kpi_default_order
+            elif is_pitching_dataset:
+                requested_default_order = pitching_default_order
             else:
-                sort_default_idx = selected_metrics.index("OPS") if "OPS" in selected_metrics else 0
-            sort_metric = st.selectbox(
-                f"{title} sort metric (P50)",
-                sort_options,
-                index=sort_default_idx,
-                key=f"{key_root}_sort_metric",
+                requested_default_order = bp_default_order
+            if is_pitching_dataset:
+                requested_default_order = _prefer_marcel_volume_bases(requested_default_order)
+            default_metrics = [m for m in requested_default_order if m in metric_bases]
+            if not default_metrics:
+                default_metrics = metric_bases[:10]
+            selected_metrics = st.multiselect(
+                f"{title} metrics",
+                metric_bases,
+                default=default_metrics,
+                key=f"{key_root}_metrics",
             )
-            sort_dir_default_idx = 1 if sort_metric == "ADP" else 0
-            sort_direction = st.selectbox(
-                f"{title} sort direction",
-                ["Descending", "Ascending"],
-                index=sort_dir_default_idx,
-                key=f"{key_root}_sort_direction",
-            )
-            sort_col = "ADP" if sort_metric == "ADP" else f"{sort_metric}_proj_p50"
-            if sort_col in df.columns:
-                df = df.sort_values(sort_col, ascending=(sort_direction == "Ascending"))
-
+            if (
+                not bool(prefer_kpi_defaults)
+                and set(selected_metrics) == {"PA"}
+                and len(default_metrics) > 1
+            ):
+                selected_metrics = list(default_metrics)
+    
+            metric_order = [m for m in requested_default_order if m in selected_metrics]
+            metric_order += [m for m in selected_metrics if m not in metric_order]
+    
+            sort_options = list(selected_metrics)
+            for metric_name in ["Points/PA", "Points/IP"]:
+                col_name = f"{metric_name}_proj_p50"
+                if col_name in df.columns and metric_name not in sort_options:
+                    sort_options.append(metric_name)
+            if "ADP" in df.columns:
+                sort_options.append("ADP")
+            if sort_options and "P50" in pct_choices:
+                if is_pitching_dataset:
+                    if "K-BB%" in selected_metrics:
+                        sort_default_idx = selected_metrics.index("K-BB%")
+                    elif "IP_marcel" in selected_metrics:
+                        sort_default_idx = selected_metrics.index("IP_marcel")
+                    elif "IP" in selected_metrics:
+                        sort_default_idx = selected_metrics.index("IP")
+                    else:
+                        sort_default_idx = 0
+                else:
+                    sort_default_idx = selected_metrics.index("OPS") if "OPS" in selected_metrics else 0
+                sort_metric = st.selectbox(
+                    f"{title} sort metric (P50)",
+                    sort_options,
+                    index=sort_default_idx,
+                    key=f"{key_root}_sort_metric",
+                )
+                sort_dir_default_idx = 1 if sort_metric == "ADP" else 0
+                sort_direction = st.selectbox(
+                    f"{title} sort direction",
+                    ["Descending", "Ascending"],
+                    index=sort_dir_default_idx,
+                    key=f"{key_root}_sort_direction",
+                )
+                sort_col = "ADP" if sort_metric == "ADP" else f"{sort_metric}_proj_p50"
+                if sort_col in df.columns:
+                    df = df.sort_values(sort_col, ascending=(sort_direction == "Ascending"))
+            st.form_submit_button("Apply Filters", type="primary")
+    
     if df.empty:
         st.info("No rows after filters. Clear one or more filters to view data.")
         return
@@ -7214,29 +7236,27 @@ def show_roster_manager(
 
         for idx, row in enumerate(state.get("hitter_reserves", [])):
             row_dict = row if isinstance(row, dict) else {"player_id": row}
-            row_id = str(row_dict.get("row_id") or f"hres_{idx+1}").strip() or f"hres_{idx+1}"
-            st.session_state[f"{key_prefix}_hres_pick_{row_id}"] = _roster_parse_int(
+            st.session_state[f"{key_prefix}_hres_pick_{idx}"] = _roster_parse_int(
                 row_dict.get("player_id")
             )
-            st.session_state[f"{key_prefix}_hres_pct_{row_id}"] = _roster_norm_percentile(
+            st.session_state[f"{key_prefix}_hres_pct_{idx}"] = _roster_norm_percentile(
                 row_dict.get("percentile"),
                 default=default_pct_local,
             )
-            st.session_state[f"{key_prefix}_hres_manual_toggle_{row_id}"] = (
+            st.session_state[f"{key_prefix}_hres_manual_toggle_{idx}"] = (
                 _roster_normalize_manual_stats(row_dict.get("manual_stats"), hitter=True) is not None
             )
 
         for idx, row in enumerate(state.get("pitcher_reserves", [])):
             row_dict = row if isinstance(row, dict) else {"player_id": row}
-            row_id = str(row_dict.get("row_id") or f"pres_{idx+1}").strip() or f"pres_{idx+1}"
-            st.session_state[f"{key_prefix}_pres_pick_{row_id}"] = _roster_parse_int(
+            st.session_state[f"{key_prefix}_pres_pick_{idx}"] = _roster_parse_int(
                 row_dict.get("player_id")
             )
-            st.session_state[f"{key_prefix}_pres_pct_{row_id}"] = _roster_norm_percentile(
+            st.session_state[f"{key_prefix}_pres_pct_{idx}"] = _roster_norm_percentile(
                 row_dict.get("percentile"),
                 default=default_pct_local,
             )
-            st.session_state[f"{key_prefix}_pres_manual_toggle_{row_id}"] = (
+            st.session_state[f"{key_prefix}_pres_manual_toggle_{idx}"] = (
                 _roster_normalize_manual_stats(row_dict.get("manual_stats"), hitter=False) is not None
             )
 
@@ -8021,71 +8041,79 @@ def show_roster_manager(
     st.dataframe(hitter_avg_rows, width="stretch", hide_index=True)
 
     st.markdown("### Hitters (Reserves)")
-    if st.button("Add hitter reserve", key=f"{key_prefix}_add_hitter_reserve"):
-        _roster_add_reserve_row(
-            state,
-            hitter=True,
-            percentile=state.get("default_percentile", "p50"),
-        )
+    st.caption("Pick players below - no page refresh until Apply Changes is clicked. Custom PA and manual stats update live after applying.")
+    with st.form(f"{key_prefix}_hitter_reserves_form"):
+        for idx in range(ROSTER_RESERVE_SLOTS):
+            row = state["hitter_reserves"][idx]
+            current_id = _roster_parse_int(row.get("player_id"))
+            current_pct = _roster_norm_percentile(
+                row.get("percentile"),
+                default=state.get("default_percentile", "p50"),
+            )
+            opt_ids = _reserve_candidate_ids(hitter=True, current_id=current_id)
+            h_res_options: list[int | None] = [None, *opt_ids]
+            h_res_default_idx = h_res_options.index(current_id) if current_id in h_res_options else 0
+            h_res_cols = st.columns([5, 1])
+            with h_res_cols[0]:
+                st.selectbox(
+                    f"Hitter Reserve {idx + 1}",
+                    h_res_options,
+                    index=h_res_default_idx,
+                    key=f"{key_prefix}_hres_pick_{idx}",
+                    format_func=lambda v: _roster_display_pick_label(v, hitter_labels, empty_label="(empty)"),
+                )
+            with h_res_cols[1]:
+                st.selectbox(
+                    f"H{idx + 1} pct",
+                    list(ROSTER_PERCENTILE_OPTIONS),
+                    index=list(ROSTER_PERCENTILE_OPTIONS).index(current_pct),
+                    key=f"{key_prefix}_hres_pct_{idx}",
+                    label_visibility="collapsed",
+                )
+        _h_res_apply = st.form_submit_button("Apply Changes", type="primary")
+
+    if _h_res_apply:
+        for idx in range(ROSTER_RESERVE_SLOTS):
+            picked_id = _roster_parse_int(st.session_state.get(f"{key_prefix}_hres_pick_{idx}"))
+            picked_pct = _roster_norm_percentile(
+                st.session_state.get(f"{key_prefix}_hres_pct_{idx}"),
+                default=state.get("default_percentile", "p50"),
+            )
+            old_id = _roster_parse_int(state["hitter_reserves"][idx].get("player_id"))
+            if picked_id != old_id:
+                state["hitter_reserves"][idx]["custom_volume"] = None
+                state["hitter_reserves"][idx]["manual_stats"] = None
+            state["hitter_reserves"][idx]["player_id"] = picked_id
+            state["hitter_reserves"][idx]["percentile"] = picked_pct
         st.rerun()
-    remove_hitter_idx: int | None = None
-    for idx, row in enumerate(state.get("hitter_reserves", [])):
-        row_id = str(row.get("row_id") or f"hres_{idx+1}")
-        current_id = _roster_parse_int(row.get("player_id"))
-        current_custom_pa = _roster_parse_nonneg_float(row.get("custom_volume"))
-        current_manual_stats = _roster_normalize_manual_stats(
-            row.get("manual_stats"),
-            hitter=True,
-        )
+
+    # Live controls for committed (applied) hitter reserve players.
+    for idx in range(ROSTER_RESERVE_SLOTS):
+        row = state["hitter_reserves"][idx]
+        picked_id = _roster_parse_int(row.get("player_id"))
+        if picked_id is None or picked_id not in hitter_pool_by_id.index:
+            continue
         current_pct = _roster_norm_percentile(
             row.get("percentile"),
             default=state.get("default_percentile", "p50"),
         )
-        opt_ids = _reserve_candidate_ids(hitter=True, current_id=current_id)
-        options: list[int | None] = [None, *opt_ids]
-        default_idx = options.index(current_id) if current_id in options else 0
-        row_cols = st.columns([4, 1, 2, 1, 1])
-        with row_cols[0]:
-            picked = st.selectbox(
-                f"Hitter Reserve {idx + 1}",
-                options,
-                index=default_idx,
-                key=f"{key_prefix}_hres_pick_{row_id}",
-                format_func=lambda v: _roster_display_pick_label(v, hitter_labels, empty_label="(empty)"),
-            )
-            picked_id = _roster_parse_int(picked)
-            if picked_id != current_id:
-                current_custom_pa = None
-                current_manual_stats = None
-            state["hitter_reserves"][idx]["player_id"] = picked_id
-        with row_cols[1]:
-            picked_pct = st.selectbox(
-                f"Hitter Reserve {idx + 1} pct",
-                list(ROSTER_PERCENTILE_OPTIONS),
-                index=list(ROSTER_PERCENTILE_OPTIONS).index(current_pct),
-                key=f"{key_prefix}_hres_pct_{row_id}",
-                label_visibility="collapsed",
-            )
-            state["hitter_reserves"][idx]["percentile"] = _roster_norm_percentile(
-                picked_pct,
-                default=state.get("default_percentile", "p50"),
-            )
-        base_pa = float("nan")
-        if picked_id is not None and picked_id in hitter_pool_by_id.index:
-            reserve_pct = _roster_norm_percentile(
-                state["hitter_reserves"][idx].get("percentile"),
-                default=state.get("default_percentile", "p50"),
-            )
-            base_pa = _roster_numeric_from_row(
-                hitter_pool_by_id.loc[int(picked_id)],
-                f"PA_proj_{reserve_pct}",
-            )
-        with row_cols[2]:
-            pa_widget_key = (
-                f"{key_prefix}_hres_pa_{row_id}_"
-                f"{picked_id if picked_id is not None else 'none'}_"
-                f"{state['hitter_reserves'][idx].get('percentile', 'p50')}"
-            )
+        current_custom_pa = _roster_parse_nonneg_float(row.get("custom_volume"))
+        current_manual_stats = _roster_normalize_manual_stats(row.get("manual_stats"), hitter=True)
+        base_pa = _roster_numeric_from_row(
+            hitter_pool_by_id.loc[int(picked_id)],
+            f"PA_proj_{current_pct}",
+        )
+        player_label = _roster_display_pick_label(picked_id, hitter_labels, empty_label="")
+        _hres_toks = set(hitter_tokens_by_id.get(picked_id, tuple()))
+        _hres_elig = [p for p in ["C", "1B", "2B", "SS", "3B", "OF"] if p in _hres_toks]
+        _hres_elig.append("UT")
+        _hres_ekey = f"{key_prefix}_helig_hres_{idx}"
+        _hres_ecur = st.session_state.get(_hres_ekey)
+        if _hres_ecur not in _hres_elig:
+            _hres_ecur = _hres_elig[0]
+        live_cols = st.columns([3, 1, 1, 4])
+        with live_cols[0]:
+            pa_widget_key = f"{key_prefix}_hres_pa_{idx}_{picked_id}_{current_pct}"
             default_pa_value = current_custom_pa
             if default_pa_value is None:
                 default_pa_value = (
@@ -8094,13 +8122,11 @@ def show_roster_manager(
                     else 0.0
                 )
             custom_pa_input = st.number_input(
-                f"Hitter Reserve {idx + 1} PA",
+                f"H{idx+1} {player_label} PA",
                 min_value=0.0,
                 value=float(default_pa_value),
                 step=1.0,
                 key=pa_widget_key,
-                disabled=(picked_id is None),
-                label_visibility="collapsed",
             )
             parsed_custom_pa = _roster_parse_nonneg_float(custom_pa_input)
             if (
@@ -8110,68 +8136,51 @@ def show_roster_manager(
                 and abs(float(parsed_custom_pa) - float(base_pa)) <= 1e-6
             ):
                 parsed_custom_pa = None
-            state["hitter_reserves"][idx]["custom_volume"] = (
-                parsed_custom_pa if picked_id is not None else None
-            )
-        with row_cols[3]:
-            use_manual = st.checkbox(
-                f"Hitter Reserve {idx + 1} manual",
-                value=(current_manual_stats is not None),
-                key=f"{key_prefix}_hres_manual_toggle_{row_id}",
-                disabled=(picked_id is None),
+            state["hitter_reserves"][idx]["custom_volume"] = parsed_custom_pa
+        with live_cols[1]:
+            st.selectbox(
+                f"H{idx+1} counts toward",
+                _hres_elig,
+                index=_hres_elig.index(_hres_ecur),
+                key=_hres_ekey,
                 label_visibility="collapsed",
             )
-            if picked_id is None:
-                state["hitter_reserves"][idx]["manual_stats"] = None
-            elif use_manual:
-                projected_seed = _hitter_stats_for_player(
-                    picked_id,
-                    pct=state["hitter_reserves"][idx]["percentile"],
-                    custom_pa=state["hitter_reserves"][idx]["custom_volume"],
+        with live_cols[2]:
+            use_manual = st.checkbox(
+                f"H{idx+1} manual",
+                value=(current_manual_stats is not None),
+                key=f"{key_prefix}_hres_manual_toggle_{idx}",
+                label_visibility="collapsed",
+            )
+        if use_manual:
+            projected_seed = _hitter_stats_for_player(
+                picked_id,
+                pct=current_pct,
+                custom_pa=state["hitter_reserves"][idx]["custom_volume"],
+            )
+            seed_manual = current_manual_stats or {
+                stat: float(projected_seed.get(stat, 0.0))
+                if np.isfinite(float(projected_seed.get(stat, float("nan"))))
+                else 0.0
+                for stat in ROSTER_HITTER_MANUAL_COUNT_STATS
+            }
+            with live_cols[3]:
+                entered_manual = _render_hitter_manual_inputs(
+                    row_key=f"hres_{idx}",
+                    defaults=seed_manual,
                 )
-                seed_manual = current_manual_stats or {
-                    stat: float(projected_seed.get(stat, 0.0))
-                    if np.isfinite(float(projected_seed.get(stat, float("nan"))))
-                    else 0.0
-                    for stat in ROSTER_HITTER_MANUAL_COUNT_STATS
-                }
-                with st.container():
-                    entered_manual = _render_hitter_manual_inputs(
-                        row_key=f"hres_{row_id}",
-                        defaults=seed_manual,
-                    )
-                state["hitter_reserves"][idx]["manual_stats"] = _roster_normalize_manual_stats(
-                    entered_manual,
-                    hitter=True,
-                )
-            else:
-                state["hitter_reserves"][idx]["manual_stats"] = None
-        with row_cols[4]:
-            if st.button("Remove", key=f"{key_prefix}_hres_remove_{row_id}"):
-                remove_hitter_idx = idx
-        if picked_id is not None and picked_id in hitter_pool_by_id.index:
-            _hres_toks = set(hitter_tokens_by_id.get(picked_id, tuple()))
-            _hres_elig = [p for p in ["C", "1B", "2B", "SS", "3B", "OF"] if p in _hres_toks]
-            _hres_elig.append("UT")
-            _hres_ekey = f"{key_prefix}_helig_hres_{row_id}"
-            _hres_ecur = st.session_state.get(_hres_ekey)
-            if _hres_ecur not in _hres_elig:
-                _hres_ecur = _hres_elig[0]
-            _hres_pcols = st.columns([3, 9])
-            with _hres_pcols[0]:
-                st.selectbox(
-                    "Count toward",
-                    _hres_elig,
-                    index=_hres_elig.index(_hres_ecur),
-                    key=_hres_ekey,
-                )
-    if remove_hitter_idx is not None:
-        state["hitter_reserves"].pop(int(remove_hitter_idx))
-        st.rerun()
+            state["hitter_reserves"][idx]["manual_stats"] = _roster_normalize_manual_stats(
+                entered_manual,
+                hitter=True,
+            )
+        else:
+            state["hitter_reserves"][idx]["manual_stats"] = None
 
     hitter_reserve_rows: list[dict[str, object]] = []
     for idx, row in enumerate(state.get("hitter_reserves", [])):
         pid = _roster_parse_int(row.get("player_id"))
+        if pid is None:
+            continue
         row_pct = _roster_norm_percentile(
             row.get("percentile"),
             default=state.get("default_percentile", "p50"),
@@ -8204,7 +8213,7 @@ def show_roster_manager(
         hitter_reserve_df["AVG"] = pd.to_numeric(hitter_reserve_df["AVG"], errors="coerce").round(3)
         st.dataframe(hitter_reserve_df, width="stretch", hide_index=True)
     else:
-        st.caption("No hitter reserves yet.")
+        st.caption("No hitter reserves applied yet.")
 
     st.markdown("### Pitchers (Starters)")
     st.caption("Pick players below — no page refresh until Apply Changes is clicked. Role picker defaults to slot role. Custom IP and manual stats are set after applying.")
@@ -8498,71 +8507,76 @@ def show_roster_manager(
     st.dataframe(pitcher_avg_rows, width="stretch", hide_index=True)
 
     st.markdown("### Pitchers (Reserves)")
-    if st.button("Add pitcher reserve", key=f"{key_prefix}_add_pitcher_reserve"):
-        _roster_add_reserve_row(
-            state,
-            hitter=False,
-            percentile=state.get("default_percentile", "p50"),
-        )
+    st.caption("Pick players below - no page refresh until Apply Changes is clicked. Custom IP and manual stats update live after applying.")
+    with st.form(f"{key_prefix}_pitcher_reserves_form"):
+        for idx in range(ROSTER_RESERVE_SLOTS):
+            row = state["pitcher_reserves"][idx]
+            current_id = _roster_parse_int(row.get("player_id"))
+            current_pct = _roster_norm_percentile(
+                row.get("percentile"),
+                default=state.get("default_percentile", "p50"),
+            )
+            opt_ids = _reserve_candidate_ids(hitter=False, current_id=current_id)
+            p_res_options: list[int | None] = [None, *opt_ids]
+            p_res_default_idx = p_res_options.index(current_id) if current_id in p_res_options else 0
+            p_res_cols = st.columns([5, 1])
+            with p_res_cols[0]:
+                st.selectbox(
+                    f"Pitcher Reserve {idx + 1}",
+                    p_res_options,
+                    index=p_res_default_idx,
+                    key=f"{key_prefix}_pres_pick_{idx}",
+                    format_func=lambda v: _roster_display_pick_label(v, pitcher_labels, empty_label="(empty)"),
+                )
+            with p_res_cols[1]:
+                st.selectbox(
+                    f"P{idx + 1} pct",
+                    list(ROSTER_PERCENTILE_OPTIONS),
+                    index=list(ROSTER_PERCENTILE_OPTIONS).index(current_pct),
+                    key=f"{key_prefix}_pres_pct_{idx}",
+                    label_visibility="collapsed",
+                )
+        _p_res_apply = st.form_submit_button("Apply Changes", type="primary")
+
+    if _p_res_apply:
+        for idx in range(ROSTER_RESERVE_SLOTS):
+            picked_id = _roster_parse_int(st.session_state.get(f"{key_prefix}_pres_pick_{idx}"))
+            picked_pct = _roster_norm_percentile(
+                st.session_state.get(f"{key_prefix}_pres_pct_{idx}"),
+                default=state.get("default_percentile", "p50"),
+            )
+            old_id = _roster_parse_int(state["pitcher_reserves"][idx].get("player_id"))
+            if picked_id != old_id:
+                state["pitcher_reserves"][idx]["custom_volume"] = None
+                state["pitcher_reserves"][idx]["manual_stats"] = None
+            state["pitcher_reserves"][idx]["player_id"] = picked_id
+            state["pitcher_reserves"][idx]["percentile"] = picked_pct
         st.rerun()
-    remove_pitcher_idx: int | None = None
-    for idx, row in enumerate(state.get("pitcher_reserves", [])):
-        row_id = str(row.get("row_id") or f"pres_{idx+1}")
-        current_id = _roster_parse_int(row.get("player_id"))
-        current_custom_ip = _roster_parse_nonneg_float(row.get("custom_volume"))
-        current_manual_stats = _roster_normalize_manual_stats(
-            row.get("manual_stats"),
-            hitter=False,
-        )
+
+    # Live controls for committed (applied) pitcher reserve players.
+    for idx in range(ROSTER_RESERVE_SLOTS):
+        row = state["pitcher_reserves"][idx]
+        picked_id = _roster_parse_int(row.get("player_id"))
+        if picked_id is None or picked_id not in pitcher_pool_by_id.index:
+            continue
         current_pct = _roster_norm_percentile(
             row.get("percentile"),
             default=state.get("default_percentile", "p50"),
         )
-        opt_ids = _reserve_candidate_ids(hitter=False, current_id=current_id)
-        options: list[int | None] = [None, *opt_ids]
-        default_idx = options.index(current_id) if current_id in options else 0
-        row_cols = st.columns([4, 1, 2, 1, 1])
-        with row_cols[0]:
-            picked = st.selectbox(
-                f"Pitcher Reserve {idx + 1}",
-                options,
-                index=default_idx,
-                key=f"{key_prefix}_pres_pick_{row_id}",
-                format_func=lambda v: _roster_display_pick_label(v, pitcher_labels, empty_label="(empty)"),
-            )
-            picked_id = _roster_parse_int(picked)
-            if picked_id != current_id:
-                current_custom_ip = None
-                current_manual_stats = None
-            state["pitcher_reserves"][idx]["player_id"] = picked_id
-        with row_cols[1]:
-            picked_pct = st.selectbox(
-                f"Pitcher Reserve {idx + 1} pct",
-                list(ROSTER_PERCENTILE_OPTIONS),
-                index=list(ROSTER_PERCENTILE_OPTIONS).index(current_pct),
-                key=f"{key_prefix}_pres_pct_{row_id}",
-                label_visibility="collapsed",
-            )
-            state["pitcher_reserves"][idx]["percentile"] = _roster_norm_percentile(
-                picked_pct,
-                default=state.get("default_percentile", "p50"),
-            )
-        base_ip = float("nan")
-        if picked_id is not None and picked_id in pitcher_pool_by_id.index:
-            reserve_pct = _roster_norm_percentile(
-                state["pitcher_reserves"][idx].get("percentile"),
-                default=state.get("default_percentile", "p50"),
-            )
-            base_ip = _roster_numeric_from_row(
-                pitcher_pool_by_id.loc[int(picked_id)],
-                f"IP_proj_{reserve_pct}",
-            )
-        with row_cols[2]:
-            ip_widget_key = (
-                f"{key_prefix}_pres_ip_{row_id}_"
-                f"{picked_id if picked_id is not None else 'none'}_"
-                f"{state['pitcher_reserves'][idx].get('percentile', 'p50')}"
-            )
+        current_custom_ip = _roster_parse_nonneg_float(row.get("custom_volume"))
+        current_manual_stats = _roster_normalize_manual_stats(row.get("manual_stats"), hitter=False)
+        base_ip = _roster_numeric_from_row(
+            pitcher_pool_by_id.loc[int(picked_id)],
+            f"IP_proj_{current_pct}",
+        )
+        player_label = _roster_display_pick_label(picked_id, pitcher_labels, empty_label="")
+        _pres_toks = set(pitcher_tokens_by_id.get(picked_id, tuple()))
+        _pres_elig = [p for p in ["SP", "RP"] if p in _pres_toks]
+        if not _pres_elig:
+            _pres_elig = ["SP", "RP"]
+        live_cols = st.columns([3, 1, 1, 4])
+        with live_cols[0]:
+            ip_widget_key = f"{key_prefix}_pres_ip_{idx}_{picked_id}_{current_pct}"
             default_ip_value = current_custom_ip
             if default_ip_value is None:
                 default_ip_value = (
@@ -8571,13 +8585,11 @@ def show_roster_manager(
                     else 0.0
                 )
             custom_ip_input = st.number_input(
-                f"Pitcher Reserve {idx + 1} IP",
+                f"P{idx+1} {player_label} IP",
                 min_value=0.0,
                 value=float(default_ip_value),
                 step=0.1,
                 key=ip_widget_key,
-                disabled=(picked_id is None),
-                label_visibility="collapsed",
             )
             parsed_custom_ip = _roster_parse_nonneg_float(custom_ip_input)
             if (
@@ -8587,70 +8599,56 @@ def show_roster_manager(
                 and abs(float(parsed_custom_ip) - float(base_ip)) <= 1e-6
             ):
                 parsed_custom_ip = None
-            state["pitcher_reserves"][idx]["custom_volume"] = (
-                parsed_custom_ip if picked_id is not None else None
-            )
-        with row_cols[3]:
+            state["pitcher_reserves"][idx]["custom_volume"] = parsed_custom_ip
+        if len(_pres_elig) > 1:
+            _pres_ekey = f"{key_prefix}_pelig_pres_{idx}"
+            _pres_ecur = st.session_state.get(_pres_ekey)
+            if _pres_ecur not in _pres_elig:
+                _pres_ecur = _pres_elig[0]
+            with live_cols[1]:
+                st.selectbox(
+                    f"P{idx+1} role",
+                    _pres_elig,
+                    index=_pres_elig.index(_pres_ecur),
+                    key=_pres_ekey,
+                    label_visibility="collapsed",
+                )
+        with live_cols[2]:
             use_manual = st.checkbox(
-                f"Pitcher Reserve {idx + 1} manual",
+                f"P{idx+1} manual",
                 value=(current_manual_stats is not None),
-                key=f"{key_prefix}_pres_manual_toggle_{row_id}",
-                disabled=(picked_id is None),
+                key=f"{key_prefix}_pres_manual_toggle_{idx}",
                 label_visibility="collapsed",
             )
-            if picked_id is None:
-                state["pitcher_reserves"][idx]["manual_stats"] = None
-            elif use_manual:
-                projected_seed = _pitcher_stats_for_player(
-                    picked_id,
-                    pct=state["pitcher_reserves"][idx]["percentile"],
-                    custom_ip=state["pitcher_reserves"][idx]["custom_volume"],
+        if use_manual:
+            projected_seed = _pitcher_stats_for_player(
+                picked_id,
+                pct=current_pct,
+                custom_ip=state["pitcher_reserves"][idx]["custom_volume"],
+            )
+            seed_manual = current_manual_stats or {
+                stat: float(projected_seed.get(stat, 0.0))
+                if np.isfinite(float(projected_seed.get(stat, float("nan"))))
+                else 0.0
+                for stat in ROSTER_PITCHER_MANUAL_COUNT_STATS
+            }
+            with live_cols[3]:
+                entered_manual = _render_pitcher_manual_inputs(
+                    row_key=f"pres_{idx}",
+                    defaults=seed_manual,
                 )
-                seed_manual = current_manual_stats or {
-                    stat: float(projected_seed.get(stat, 0.0))
-                    if np.isfinite(float(projected_seed.get(stat, float("nan"))))
-                    else 0.0
-                    for stat in ROSTER_PITCHER_MANUAL_COUNT_STATS
-                }
-                with st.container():
-                    entered_manual = _render_pitcher_manual_inputs(
-                        row_key=f"pres_{row_id}",
-                        defaults=seed_manual,
-                    )
-                state["pitcher_reserves"][idx]["manual_stats"] = _roster_normalize_manual_stats(
-                    entered_manual,
-                    hitter=False,
-                )
-            else:
-                state["pitcher_reserves"][idx]["manual_stats"] = None
-        with row_cols[4]:
-            if st.button("Remove", key=f"{key_prefix}_pres_remove_{row_id}"):
-                remove_pitcher_idx = idx
-        if picked_id is not None and picked_id in pitcher_pool_by_id.index:
-            _pres_toks = set(pitcher_tokens_by_id.get(picked_id, tuple()))
-            _pres_elig = [p for p in ["SP", "RP"] if p in _pres_toks]
-            if not _pres_elig:
-                _pres_elig = ["SP", "RP"]
-            if len(_pres_elig) > 1:
-                _pres_ekey = f"{key_prefix}_pelig_pres_{row_id}"
-                _pres_ecur = st.session_state.get(_pres_ekey)
-                if _pres_ecur not in _pres_elig:
-                    _pres_ecur = _pres_elig[0]
-                _pres_pcols = st.columns([3, 9])
-                with _pres_pcols[0]:
-                    st.selectbox(
-                        "Role",
-                        _pres_elig,
-                        index=_pres_elig.index(_pres_ecur),
-                        key=_pres_ekey,
-                    )
-    if remove_pitcher_idx is not None:
-        state["pitcher_reserves"].pop(int(remove_pitcher_idx))
-        st.rerun()
+            state["pitcher_reserves"][idx]["manual_stats"] = _roster_normalize_manual_stats(
+                entered_manual,
+                hitter=False,
+            )
+        else:
+            state["pitcher_reserves"][idx]["manual_stats"] = None
 
     pitcher_reserve_rows: list[dict[str, object]] = []
     for idx, row in enumerate(state.get("pitcher_reserves", [])):
         pid = _roster_parse_int(row.get("player_id"))
+        if pid is None:
+            continue
         row_pct = _roster_norm_percentile(
             row.get("percentile"),
             default=state.get("default_percentile", "p50"),
@@ -8707,13 +8705,12 @@ def show_roster_manager(
             elig_counts[chosen] += 1
             hitter_elig_total += 1
     for idx, row in enumerate(state.get("hitter_reserves", [])):
-        _hres_row_id = str(row.get("row_id") or f"hres_{idx+1}")
         pid = _roster_parse_int(row.get("player_id"))
         if pid is not None and pid in hitter_pool_by_id.index:
             _h_toks = set(hitter_tokens_by_id.get(pid, tuple()))
             _h_elig = [p for p in ["C", "1B", "2B", "SS", "3B", "OF"] if p in _h_toks]
             _h_elig.append("UT")
-            _ekey = f"{key_prefix}_helig_hres_{_hres_row_id}"
+            _ekey = f"{key_prefix}_helig_hres_{idx}"
             chosen = st.session_state.get(_ekey, _h_elig[0])
             if chosen not in _h_elig:
                 chosen = _h_elig[0]
@@ -8744,14 +8741,13 @@ def show_roster_manager(
             pitcher_elig_counts[chosen] += 1
             pitcher_elig_total += 1
     for idx, row in enumerate(state.get("pitcher_reserves", [])):
-        _pres_row_id = str(row.get("row_id") or f"pres_{idx+1}")
         pid = _roster_parse_int(row.get("player_id"))
         if pid is not None and pid in pitcher_pool_by_id.index:
             _p_toks = set(pitcher_tokens_by_id.get(pid, tuple()))
             _p_elig = [p for p in ["SP", "RP"] if p in _p_toks]
             if not _p_elig:
                 _p_elig = ["SP", "RP"]
-            _rekey = f"{key_prefix}_pelig_pres_{_pres_row_id}"
+            _rekey = f"{key_prefix}_pelig_pres_{idx}"
             chosen = st.session_state.get(_rekey, _p_elig[0])
             if chosen not in pitcher_elig_counts:
                 chosen = _p_elig[0]
