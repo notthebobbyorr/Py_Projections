@@ -4852,6 +4852,10 @@ def _deserialize_roster_state(raw_state: object, hitter_pool: pd.DataFrame, pitc
             else:
                 dropped += 1
 
+    # Clear the pre-populated default rows before loading saved data so _load_reserves
+    # appends only the saved players (not stacked on top of the 15 empty defaults).
+    state["hitter_reserves"] = []
+    state["pitcher_reserves"] = []
     _load_reserves(raw_state.get("hitter_reserves"), hitter=True)
     _load_reserves(raw_state.get("pitcher_reserves"), hitter=False)
     # Always ensure exactly ROSTER_RESERVE_SLOTS entries in each reserve list.
