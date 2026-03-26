@@ -499,7 +499,7 @@ def load_projection(path: Path) -> pd.DataFrame:
     return pd.read_parquet(path)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def _load_stuff_grade_reference_2025_mlb() -> tuple[float, float]:
     for path in STUFF_GRADE_REF_PATHS:
         if not path.exists():
@@ -623,7 +623,7 @@ def _load_xlsx_first_sheet_fallback(path: Path) -> pd.DataFrame:
     return pd.DataFrame(records, columns=headers)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def _load_40man_roster_raw() -> pd.DataFrame:
     if FORTY_MAN_ROSTER_PATH.exists():
         try:
@@ -649,7 +649,7 @@ def _is_pitcher_pos(pos: object) -> bool:
     return any(tok in FORTY_MAN_PITCHER_POS_TOKENS for tok in toks)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def _load_40man_lookup(*, for_pitchers: bool) -> pd.DataFrame:
     roster = _load_40man_roster_raw()
     required_cols = {FORTY_MAN_ID_COL, FORTY_MAN_TEAM_COL, FORTY_MAN_ROLE_COL}
@@ -2130,7 +2130,7 @@ def _redistribute_team_saves_by_role(df: pd.DataFrame) -> tuple[pd.DataFrame, di
     return out, {"teams_adjusted": teams_adjusted, "players_receiving_sv": players_receiving_sv}
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def _load_source_season_mlb_pa_lookup(
     path: Path = BP_HITTING_MLB_PA_LOOKUP_PATH,
 ) -> pd.DataFrame:
@@ -2169,7 +2169,7 @@ def _load_source_season_mlb_pa_lookup(
     return out
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def _load_hitter_position_counts_lookup() -> pd.DataFrame:
     source_path = (
         HITTER_POSITION_SOURCE_PARQUET_PATH
@@ -2312,7 +2312,7 @@ def _attach_hitter_position_counts(df: pd.DataFrame) -> pd.DataFrame:
     return merged
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def _load_weighted_ops_mu_by_season(
     path: Path = BP_HITTING_MLB_PA_LOOKUP_PATH,
 ) -> dict[int, float]:
@@ -2362,7 +2362,7 @@ def _load_weighted_ops_mu_by_season(
     return out
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def _load_ops_sigma_by_season_from_reference(
     path: Path = ZSPACE_REFERENCE_MLB_PA_GTE_100_PATH,
 ) -> dict[int, float]:
@@ -2398,7 +2398,7 @@ def _load_ops_sigma_by_season_from_reference(
     return out
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def _load_weighted_era_mu_by_season(
     path: Path = BP_PITCHING_MLB_LOOKUP_PATH,
 ) -> dict[int, float]:
@@ -2457,7 +2457,7 @@ def _load_weighted_era_mu_by_season(
     return out
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def _load_weighted_whip_mu_by_season(
     path: Path = BP_PITCHING_MLB_LOOKUP_PATH,
 ) -> dict[int, float]:
@@ -3832,7 +3832,7 @@ def _adp_to_pick_notation(value: object, *, teams: int = ADP_DRAFT_TEAMS) -> str
     return f"{int(round_num)}.{int(pick_in_round)}"
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_resource(show_spinner=False)
 def _load_adp_lookup() -> pd.DataFrame:
     if not ADP_PATH.exists():
         return pd.DataFrame()
